@@ -54,19 +54,21 @@ def _parse_int(val: str, default: int, name: str) -> int:
 class Config:
     """Runtime configuration for Memory Aid."""
 
-    anthropic_api_key: str = ""
-    model: str = "claude-haiku-5-5"
+    gemini_api_key: str = ""
+    model: str = "gemini-2.5-flash"
     audio_device: str = "default"
+    record_device: str = "default"
     voice: str = "en-us"
     speech_rate: int = 140
     button_pin: int = 17
+    record_button_pin: int = 27
     memories_dir: Path = Path("memories")
     save_last_capture: bool = False
     last_capture_path: Path = Path("last_capture.jpg")
 
     @property
     def has_api_key(self) -> bool:
-        return bool(self.anthropic_api_key and self.anthropic_api_key.strip())
+        return bool(self.gemini_api_key and self.gemini_api_key.strip())
 
 
 def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = None) -> Config:
@@ -92,24 +94,28 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
         merged.update(_parse_env_file(local_env))
 
     for key in (
-        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
         "MODEL",
         "AUDIO_DEVICE",
+        "RECORD_DEVICE",
         "VOICE",
         "SPEECH_RATE",
         "BUTTON_PIN",
+        "RECORD_BUTTON_PIN",
         "MEMORIES_DIR",
         "SAVE_LAST_CAPTURE",
     ):
         if key in os.environ:
             merged[key] = os.environ[key]
 
-    api_key = merged.get("ANTHROPIC_API_KEY", "").strip()
-    model = merged.get("MODEL", "").strip() or "claude-haiku-5-5"
+    api_key = merged.get("GEMINI_API_KEY", "").strip()
+    model = merged.get("MODEL", "").strip() or "gemini-2.5-flash"
     audio_device = merged.get("AUDIO_DEVICE", "").strip() or "default"
+    record_device = merged.get("RECORD_DEVICE", "").strip() or audio_device
     voice = merged.get("VOICE", "").strip() or "en-us"
     speech_rate = _parse_int(merged.get("SPEECH_RATE", "140"), 140, "SPEECH_RATE")
     button_pin = _parse_int(merged.get("BUTTON_PIN", "17"), 17, "BUTTON_PIN")
+    record_button_pin = _parse_int(merged.get("RECORD_BUTTON_PIN", "27"), 27, "RECORD_BUTTON_PIN")
 
     raw_memories_dir = merged.get("MEMORIES_DIR", "").strip()
     if raw_memories_dir:
@@ -123,12 +129,14 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
     last_capture_path = (project_root / "last_capture.jpg").resolve()
 
     return Config(
-        anthropic_api_key=api_key,
+        gemini_api_key=api_key,
         model=model,
         audio_device=audio_device,
+        record_device=record_device,
         voice=voice,
         speech_rate=speech_rate,
         button_pin=button_pin,
+        record_button_pin=record_button_pin,
         memories_dir=memories_dir,
         save_last_capture=save_last_capture,
         last_capture_path=last_capture_path,

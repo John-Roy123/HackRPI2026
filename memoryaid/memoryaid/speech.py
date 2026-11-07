@@ -1,13 +1,143 @@
-"""Speech synthesis output via espeak-ng piped to aplay, with laptop mock fallbacks."""
+"""Speech synthesis output (espeak-ng -> aplay) and microphone recording (arecord)."""
 
 import logging
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger("memoryaid")
+
+MAX_RECORD_SECONDS = 60
+
+
+class AudioRecordError(Exception):
+    """Raised when microphone recording fails."""
+
+
+class AudioRecorder:
+    """Records 16 kHz mono WAV audio via `arecord` while the record button is held."""
+
+    def __init__(self, record_device: str = "default", mock: bool = False) -> None:
+        self.record_device = record_device
+        self.mock = mock
+        self._lock = threading.Lock()
+        self._proc: Optional[subprocess.Popen] = None
+        self._temp_path: Optional[Path] = None
+        self._has_arecord = shutil.which("arecord") is not None
+
+    def start_recording(self) -> None:
+        """Start background `arecord` capture to a temporary WAV file."""
+        with self._lock:
+            self._cleanup_Unlocked()
+            if self.mock or not self._has_arecord:
+                logger.info("AudioRecorder (mock): started listening.")
+                return
+
+            fd, tmp_name = tempfile.mkstemp(prefix="memoryaid_rec_", suffix=".wav")
+            import os
+
+            os.close(fd)
+            self._temp_path = Path(tmp_name)
+
+            cmd = [
+                "arecord",
+                "-q",
+                "-D",
+                self.record_device,
+                "-f",
+                "S16_LE",
+                "-r",
+                "16000",
+                "-c",
+                "1",
+                "-t",
+                "wav",
+                "-d",
+                str(MAX_RECORD_SECONDS),
+                str(self._temp_path),
+            ]
+            try:
+                self._proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                logger.info(
+                    "Started recording audio from ALSA device %r to %s",
+                    self.record_device,
+                    self._temp_path,
+                )
+            except Exception as exc:
+                self._cleanup_Unlocked()
+                raise AudioRecordError(f"Failed to start arecord: {exc}") from exc
+
+    def stop_recording(self) -> bytes:
+        """Stop `arecord`, read the recorded WAV bytes, and delete the temporary file."""
+        with self._lock:
+            if self.mock or not self._has_arecord:
+                logger.info("AudioRecorder (mock): stopped listening.")
+                return b""
+
+            proc = self._proc
+            temp_path = self._temp_path
+            self._proc = None
+            self._temp_path = None
+
+            if proc is None or temp_path is None:
+                raise AudioRecordError("Recording was not active.")
+
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3.0)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=1.0)
+
+                stderr_bytes = proc.stderr.read() if proc.stderr else b""
+                if proc.stderr:
+                    proc.stderr.close()
+
+                if not temp_path.is_file():
+                    err_msg = stderr_bytes.decode("utf-8", errors="replace").strip()
+                    raise AudioRecordError(f"arecord produced no file ({err_msg})")
+
+                wav_bytes = temp_path.read_bytes()
+                if len(wav_bytes) <= 44:
+                    err_msg = stderr_bytes.decode("utf-8", errors="replace").strip()
+                    raise AudioRecordError(f"Recorded audio is empty ({len(wav_bytes)} bytes). {err_msg}")
+
+                logger.info("Recorded %d bytes (%.1f KB) of WAV audio.", len(wav_bytes), len(wav_bytes) / 1024.0)
+                return wav_bytes
+            finally:
+                try:
+                    if temp_path.exists():
+                        temp_path.unlink()
+                except OSError:
+                    pass
+
+    def _cleanup_Unlocked(self) -> None:
+        if self._proc is not None:
+            try:
+                if self._proc.poll() is None:
+                    self._proc.kill()
+                    self._proc.wait(timeout=1.0)
+            except Exception:
+                pass
+            self._proc = None
+        if self._temp_path is not None:
+            try:
+                if self._temp_path.exists():
+                    self._temp_path.unlink()
+            except OSError:
+                pass
+            self._temp_path = None
 
 
 class Speaker:

@@ -1,6 +1,8 @@
 # Memory Aid
 
-Memory Aid is a screenless, single-button wearable or handheld camera companion for people living with Alzheimer's disease and other dementias. When the user presses the button, the device photographs what is in front of them, checks whether it matches a familiar place from their caregiver's memory book, and speaks a short, warm, reassuring description aloud.
+Memory Aid is a screenless, two-button wearable or handheld camera companion for people living with Alzheimer's disease and other dementias:
+1. **Button 1 — Record Memory (Press & Hold, GPIO27 / Pin 13)**: Press and hold while speaking about a room or place. The Pi takes a picture and listens to what you say, then writes your spoken words (`note.txt` and `memories/recorded_notes.txt`) and the photo (`1.jpg`) to disk so the room is saved to the memory book.
+2. **Button 2 — "Where am I?" (Single Press, GPIO17 / Pin 11)**: Press once. The Pi takes a picture of what is in front of you, determines what room or place you are in using your saved memories, and speaks a warm, reassuring answer aloud.
 
 ---
 
@@ -10,10 +12,10 @@ Use this exact hardware list:
 
 - **Raspberry Pi Zero W (1st generation)** — ARMv6 single-core 1 GHz, 512 MB RAM, 2.4 GHz Wi-Fi only, with 40-pin GPIO header pins soldered.
 - **Raspberry Pi Camera Module** (v1.3, v2, or v3) connected with the **narrow 22-pin Pi Zero camera ribbon cable** (15-pin on the camera end to 22-pin fine pitch on the Pi Zero end).
-- **Momentary push button** (2-leg or 4-leg tactile push button) + 2 female-to-female jumper wires (or soldered leads). No resistor required (uses the Pi's internal pull-up).
+- **Two (2) momentary push buttons** + 4 female-to-female jumper wires (or soldered leads). No resistors required (both use the Pi's internal pull-ups).
 - **Micro-USB OTG adapter** (micro-USB male to USB-A female) — **required** to plug a standard USB audio dongle into the Pi Zero W's data port.
-- **USB audio dongle** (standard plug-and-play USB sound card with 3.5 mm jack).
-- **Small powered speaker or headphones** (with a 3.5 mm audio plug connected to the USB audio dongle).
+- **USB audio dongle** (standard plug-and-play USB sound card with 3.5 mm speaker + 3.5 mm microphone jacks, or TRRS headset jack).
+- **Small powered speaker (or headphones) + microphone** plugged into the USB audio dongle.
 - **MicroSD card** (8 GB or 16 GB Class 10 / A1 recommended) + card reader for your laptop.
 - **USB power bank** + micro-USB cable for power.
 
@@ -21,9 +23,9 @@ Use this exact hardware list:
 
 ## 2. Wiring
 
-### GPIO Button Wiring (Pin 9 GND & Pin 11 GPIO17)
-
-Connect one leg of the momentary push button to **Physical Pin 9 (GND)** and the other leg to **Physical Pin 11 (GPIO17)**. Polarity does not matter for a momentary switch.
+### Two-Button GPIO Wiring
+- **Button 2 ("Where am I?" — Single Press)**: Connect between **Physical Pin 9 (GND)** and **Physical Pin 11 (GPIO17)**.
+- **Button 1 ("Record Memory" — Press & Hold)**: Connect between **Physical Pin 14 (GND)** and **Physical Pin 13 (GPIO27)**.
 
 ```text
              Raspberry Pi Zero W — 40-Pin GPIO Header
@@ -37,14 +39,16 @@ Connect one leg of the momentary push button to **Physical Pin 9 (GND)** and the
    +-----[Pin 9]--+-----+-----+
    |      GPIO17  | 11  | 12  |  GPIO18
    |  +--[Pin 11]-+-----+-----+
-   |  |   GPIO27  | 13  | 14  |  GND
-   |  |   GPIO22  | 15  | 16  |  GPIO23
-   |  |      3V3  | 17  | 18  |  GPIO24
-   |  |      ...  | ... | ... |  ...
-   |  |           +-----+-----+
-   |  |
-   |  +-----> [ Momentary Push Button ] <-----+
-   +------------------------------------------+
+   |  |   GPIO27  | 13  | 14  |  GND  <--[Pin 14]----+
+   |  |  +[Pin 13]+-----+-----+                      |
+   |  |  | GPIO22 | 15  | 16  |  GPIO23              |
+   |  |  |    3V3 | 17  | 18  |  GPIO24              |
+   |  |  |    ... | ... | ... |  ...                 |
+   |  |  |        +-----+-----+                      |
+   |  |  |                                           |
+   |  |  +--------> [ Button 1: HOLD TO RECORD ] <---+
+   |  +-----------> [ Button 2: WHERE AM I?    ] <---+
+   +-------------------------------------------------+
 ```
 
 ### Camera Ribbon Orientation & Micro-USB Ports
@@ -144,13 +148,13 @@ chmod +x setup.sh
 sudo ./setup.sh
 ```
 
-Now add your Anthropic API key to `/etc/memoryaid.env`:
+Now add your Google Gemini API key to `/etc/memoryaid.env`:
 
 ```bash
 sudo nano /etc/memoryaid.env
 ```
 
-Set `ANTHROPIC_API_KEY=sk-ant-...`, save (`Ctrl+O`, `Enter`, `Ctrl+X`), and restart the service:
+Set `GEMINI_API_KEY=AIzaSy...` (from [Google AI Studio](https://aistudio.google.com/apikey)), save (`Ctrl+O`, `Enter`, `Ctrl+X`), and restart the service:
 
 ```bash
 sudo systemctl restart memoryaid
@@ -171,13 +175,14 @@ Before relying on the full service, you can verify each piece of hardware indivi
    rpicam-still -o test.jpg
    ls -lh test.jpg
    ```
-2. **Test the Audio Output**:
+2. **Test the Audio Output & Microphone**:
    ```bash
    espeak-ng "hello" --stdout | aplay
+   arecord -f S16_LE -r 16000 -c 1 -d 3 test_mic.wav && aplay test_mic.wav
    ```
-3. **Test the Button (one-line gpiozero check)**:
+3. **Test Both Buttons (one-line gpiozero check)**:
    ```bash
-   python3 -c "from gpiozero import Button; b = Button(17, pull_up=True); print('Press the button...'); b.wait_for_press(); print('Button pressed!')"
+   python3 -c "from gpiozero import Button; b1 = Button(17, pull_up=True); b2 = Button(27, pull_up=True); print('Press Where-Am-I button (GPIO17)...'); b1.wait_for_press(); print('GPIO17 pressed! Now press Record button (GPIO27)...'); b2.wait_for_press(); print('GPIO27 pressed!')"
    ```
 4. **Start & Watch the Service Logs**:
    ```bash
@@ -233,11 +238,13 @@ You can run the entire pipeline on your laptop without a Raspberry Pi (`picamera
    ```bash
    python3 -m memoryaid --mock --dry-run --image path/to/photo.jpg
    ```
-2. **Interactive Mock Mode (Enter key = button press, `q` + Enter = quit)**:
+2. **Interactive Mock Mode (Enter = "Where am I?", `r` + Enter = "Hold to Record Memory", `q` + Enter = quit)**:
    ```bash
-   export ANTHROPIC_API_KEY="sk-ant-..."
+   export GEMINI_API_KEY="AIzaSy..."
    python3 -m memoryaid --mock --image path/to/photo.jpg
    ```
+   - Press **Enter** to simulate pressing the **"Where am I?"** button.
+   - Type **`r`** and press **Enter** to simulate pressing & holding the **Record Memory** button: it takes a picture, prompts you for what you said, saves the spoken text to `memories/<place_name>/note.txt` (and appends to `memories/recorded_notes.txt`) alongside `1.jpg`, and reloads the memory book immediately.
    *(You can also pass a folder of images to `--image` and MockCamera will cycle through them on each press.)*
 3. **Run the Unit Test Suite**:
    ```bash
@@ -265,10 +272,10 @@ You can run the entire pipeline on your laptop without a Raspberry Pi (`picamera
   - Check your phone hotspot's connected-devices screen to see the Pi's IP address and run `ssh pi@<IP_ADDRESS>`.
 - **Slow responses**:
   - Wait until you hear the startup greeting (*"Hello. Press the button..."*) before pressing the button; importing `picamera2` takes 20–30 s on cold start.
-  - Keep `MODEL=claude-haiku-5-5` in `/etc/memoryaid.env`.
+  - Keep `MODEL=gemini-2.5-flash` in `/etc/memoryaid.env`.
   - Keep reference photos to 1–2 per place.
 - **API errors (bad key, no credit)**:
-  - Check `journalctl -u memoryaid -n 50` for `HTTP 401` (invalid `ANTHROPIC_API_KEY`) or `HTTP 400/429` (insufficient credits / rate limit).
+  - Check `journalctl -u memoryaid -n 50` for `HTTP 400/403` (invalid `GEMINI_API_KEY`) or `HTTP 429` (quota / rate limit).
   - Double-check `/etc/memoryaid.env` has no stray spaces or quotes around the key.
 - **Service keeps restarting**:
   - Run `journalctl -u memoryaid -f` to inspect the startup traceback.
@@ -307,8 +314,8 @@ Memory Aid pipes `espeak-ng --stdout` into `aplay -q -D <AUDIO_DEVICE>`, so swap
 ## 13. Privacy
 
 - **No photos stored on disk by default**: Captured camera frames are resized and base64-encoded purely in RAM (`SAVE_LAST_CAPTURE=false`) and discarded immediately after each request.
-- **Encrypted transit**: Photos and caregiver notes are sent over HTTPS (`https://api.anthropic.com/v1/messages`) only when the user physically presses the button.
-- **No secret logging**: Neither `ANTHROPIC_API_KEY` nor base64 image payloads are ever written to logs.
+- **Encrypted transit**: Photos and caregiver notes are sent over HTTPS (`https://generativelanguage.googleapis.com/v1beta/models/...:generateContent`) only when the user physically presses the button.
+- **No secret logging**: Neither `GEMINI_API_KEY` nor base64 image payloads are ever written to logs.
 
 ---
 

@@ -8,11 +8,11 @@ from pathlib import Path
 from typing import List, Optional
 
 from .app import MemoryAidApp
-from .button import GpioButton, KeyboardButton
+from .button import GpioButtons, KeyboardButton
 from .camera import MockCamera, PiCamera
 from .config import load_config
 from .memories import load_memories
-from .speech import Speaker
+from .speech import AudioRecorder, Speaker
 
 
 def _configure_logging() -> None:
@@ -27,12 +27,12 @@ def _configure_logging() -> None:
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="memoryaid",
-        description="Memory Aid: A screenless camera device for people living with dementia.",
+        description="Memory Aid: A screenless two-button camera device for people living with dementia.",
     )
     parser.add_argument(
         "--mock",
         action="store_true",
-        help="Run in laptop mock mode (no picamera2 or gpiozero imports; Enter key acts as button).",
+        help="Run in laptop mock mode (no picamera2 or gpiozero imports; Enter = Where am I, 'r' = Record Memory).",
     )
     parser.add_argument(
         "--image",
@@ -65,11 +65,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     config = load_config(env_file=args.env_file)
     logger.info(
-        "Loaded config: model=%s, audio_device=%s, voice=%s, rate=%d, memories_dir=%s, mock=%s",
+        "Loaded config: model=%s, audio=%s, record=%s, identify_pin=%d, record_pin=%d, memories_dir=%s, mock=%s",
         config.model,
         config.audio_device,
-        config.voice,
-        config.speech_rate,
+        config.record_device,
+        config.button_pin,
+        config.record_button_pin,
         config.memories_dir,
         args.mock,
     )
@@ -94,6 +95,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         speech_rate=config.speech_rate,
         mock=args.mock,
     )
+    recorder = AudioRecorder(
+        record_device=config.record_device,
+        mock=args.mock,
+    )
 
     if args.dry_run:
         app = MemoryAidApp(
@@ -101,6 +106,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             places=places,
             camera=camera,
             speaker=speaker,
+            recorder=recorder,
             button=None,
         )
         try:
@@ -116,16 +122,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         places=places,
         camera=camera,
         speaker=speaker,
+        recorder=recorder,
         button=None,
     )
 
     if args.mock:
-        button = KeyboardButton(on_press=app.handle_button_press)
+        button = KeyboardButton(
+            on_identify_press=app.handle_button_press,
+            on_mock_record=app.handle_mock_record,
+        )
     else:
-        button = GpioButton(
-            pin=config.button_pin,
+        button = GpioButtons(
+            identify_pin=config.button_pin,
+            record_pin=config.record_button_pin,
             bounce_time=0.1,
-            on_press=app.handle_button_press,
+            on_identify_press=app.handle_button_press,
+            on_record_press=app.handle_record_press,
+            on_record_release=app.handle_record_release,
         )
     app.button = button
 

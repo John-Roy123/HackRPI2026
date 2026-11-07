@@ -1,10 +1,12 @@
-"""Memory book loading, reference image preprocessing, and disk caching."""
+"""Memory book loading, saving new recorded places, reference image preprocessing, and disk caching."""
 
 import base64
 import hashlib
 import io
 import json
 import logging
+import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Set
@@ -22,7 +24,7 @@ REF_JPEG_QUALITY = 75
 
 @dataclass
 class PlaceMemory:
-    """Represents one known place from the caregiver's memory book."""
+    """Represents one known place from the caregiver's/user's memory book."""
 
     name: str
     note: str
@@ -57,6 +59,81 @@ def preprocess_image_file_to_b64(
     with Image.open(path) as img:
         jpeg_bytes = preprocess_image_bytes(img, max_edge=max_edge, quality=quality)
     return base64.b64encode(jpeg_bytes).decode("ascii")
+
+
+def slugify_place_name(text: str) -> str:
+    """Create a filesystem-safe folder slug from a spoken note or place name."""
+    cleaned = text.lower().replace("'", "").replace("\u2019", "")
+    words = re.findall(r"[a-z0-9]+", cleaned)
+    stop_words = {"this", "is", "the", "a", "an", "you", "are", "in", "at", "my", "our", "here", "we"}
+    filtered = [w for w in words if w not in stop_words]
+    chosen = (filtered or words)[:4]
+    slug = "_".join(chosen).strip("_")
+    if not slug:
+        slug = f"memory_{int(time.time())}"
+    return slug[:40]
+
+
+def save_recorded_memory(
+    memories_dir: Path,
+    captured_b64: str,
+    note_text: str,
+    place_name_hint: str = "",
+) -> PlaceMemory:
+    """Save a newly recorded photo and spoken transcript into `memories/<place_slug>/` and return the PlaceMemory.
+
+    Writes:
+      - `memories/<slug>/note.txt` with what the user said
+      - `memories/<slug>/1.jpg` (or `2.jpg` if `1.jpg` already exists)
+    """
+    memories_dir.mkdir(parents=True, exist_ok=True)
+    slug = slugify_place_name(place_name_hint or note_text)
+    place_dir = memories_dir / slug
+
+    # If the folder already has 2 photos and a different note, create a uniquely numbered folder
+    if place_dir.exists():
+        existing_photos = sorted(
+            [
+                p
+                for p in place_dir.iterdir()
+                if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS
+            ]
+        )
+        if len(existing_photos) >= MAX_PHOTOS_PER_PLACE:
+            slug = f"{slug}_{int(time.time()) % 10000}"
+            place_dir = memories_dir / slug
+
+    place_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write note.txt
+    note_path = place_dir / "note.txt"
+    clean_note = note_text.strip()
+    note_path.write_text(clean_note + "\n", encoding="utf-8")
+
+    # Decode the captured JPEG and save as 1.jpg (or 2.jpg)
+    raw_jpeg = base64.b64decode(captured_b64)
+    photo_1 = place_dir / "1.jpg"
+    photo_2 = place_dir / "2.jpg"
+    target_photo = photo_2 if photo_1.exists() else photo_1
+    target_photo.write_bytes(raw_jpeg)
+
+    # Also append to a master log file `memories/recorded_notes.txt` so every entry is easily readable in one file
+    log_file = memories_dir / "recorded_notes.txt"
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    with log_file.open("a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] ({slug}/{target_photo.name}): {clean_note}\n")
+
+    logger.info(
+        "Saved recorded memory to %s (note=%r, photo=%s)",
+        place_dir,
+        clean_note,
+        target_photo.name,
+    )
+
+    ref_b64 = preprocess_image_file_to_b64(
+        target_photo, max_edge=REF_MAX_EDGE, quality=REF_JPEG_QUALITY
+    )
+    return PlaceMemory(name=slug, note=clean_note, images_b64=[ref_b64])
 
 
 def _cache_key_for_source(source_path: Path, root_dir: Path) -> str:

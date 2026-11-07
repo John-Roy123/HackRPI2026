@@ -56,17 +56,25 @@ if [ -n "$USB_CARD" ]; then
     echo "    Found USB audio device on ALSA card $USB_CARD. Writing /etc/asound.conf..."
     cat >/etc/asound.conf <<EOF
 pcm.!default {
-    type plug
-    slave.pcm "hw:${USB_CARD},0"
+    type asym
+    playback.pcm {
+        type plug
+        slave.pcm "hw:${USB_CARD},0"
+    }
+    capture.pcm {
+        type plug
+        slave.pcm "hw:${USB_CARD},0"
+    }
 }
 ctl.!default {
     type hw
     card ${USB_CARD}
 }
 EOF
-    echo "    Setting USB audio volume to ~85%..."
-    for control in Speaker PCM Master Headphone; do
+    echo "    Setting USB audio playback and microphone volume to ~85%..."
+    for control in Speaker PCM Master Headphone Mic Capture; do
         if amixer -c "$USB_CARD" scontrols 2>/dev/null | grep -q "'${control}'"; then
+            amixer -c "$USB_CARD" sset "$control" 85% unmute cap >/dev/null 2>&1 || \
             amixer -c "$USB_CARD" sset "$control" 85% unmute >/dev/null 2>&1 || true
         fi
     done
@@ -97,11 +105,11 @@ systemctl restart memoryaid.service || true
 echo "==> [7/7] Setup complete!"
 echo ""
 echo "NEXT STEPS:"
-echo "  1. Edit /etc/memoryaid.env and add your ANTHROPIC_API_KEY:"
+echo "  1. Edit /etc/memoryaid.env and add your GEMINI_API_KEY:"
 echo "       sudo nano /etc/memoryaid.env"
 echo "  2. Restart the service:"
 echo "       sudo systemctl restart memoryaid"
 echo "  3. Watch the live logs:"
 echo "       journalctl -u memoryaid -f"
 echo ""
-echo "NOTE: Until you add your ANTHROPIC_API_KEY to /etc/memoryaid.env, the device will speak a reminder that it is not set up yet."
+echo "NOTE: Until you add your GEMINI_API_KEY to /etc/memoryaid.env, the device will speak a reminder that it is not set up yet."
