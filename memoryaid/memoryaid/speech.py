@@ -1,5 +1,6 @@
-"""Bluetooth / ALSA speaker playback (espeak-ng -> paplay/pw-play/aplay) and microphone recording (arecord)."""
+"""ElevenLabs Text-to-Speech (with local fallback) and ALSA microphone recording (`arecord`)."""
 
+import io
 import logging
 import os
 import re
@@ -8,13 +9,21 @@ import subprocess
 import tempfile
 import threading
 import time
+import wave
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
+
+import requests
+
+from .config import DEFAULT_ELEVENLABS_MODEL_ID, DEFAULT_ELEVENLABS_VOICE_ID
 
 logger = logging.getLogger("memoryaid")
 
 MAX_RECORD_SECONDS = 60
 MAC_REGEX = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
+ELEVENLABS_API_BASE = "https://api.elevenlabs.io/v1/text-to-speech"
+ELEVENLABS_PCM_SAMPLE_RATE = 22050
+ELEVENLABS_TIMEOUT_SECONDS = 20
 
 
 class AudioRecordError(Exception):
@@ -31,6 +40,60 @@ def _speech_env() -> dict:
     if "DBUS_SESSION_BUS_ADDRESS" not in env and os.path.exists(f"{runtime_dir}/bus"):
         env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={runtime_dir}/bus"
     return env
+
+
+def pcm16_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = ELEVENLABS_PCM_SAMPLE_RATE) -> bytes:
+    """Wrap raw 16-bit little-endian mono PCM bytes into a standard WAV container in memory."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit (2 bytes)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+
+def synthesize_elevenlabs_wav(
+    text: str,
+    api_key: str,
+    voice_id: str = DEFAULT_ELEVENLABS_VOICE_ID,
+    model_id: str = DEFAULT_ELEVENLABS_MODEL_ID,
+    timeout: float = ELEVENLABS_TIMEOUT_SECONDS,
+) -> bytes:
+    """Call ElevenLabs Text-to-Speech HTTP API (`output_format=pcm_22050`) and return WAV bytes."""
+    url = f"{ELEVENLABS_API_BASE}/{voice_id.strip()}"
+    headers = {
+        "xi-api-key": api_key.strip(),
+        "Content-Type": "application/json",
+    }
+    params = {
+        "output_format": "pcm_22050",
+    }
+    payload = {
+        "text": text,
+        "model_id": model_id.strip() or DEFAULT_ELEVENLABS_MODEL_ID,
+        "voice_settings": {
+            "stability": 0.65,
+            "similarity_boost": 0.75,
+        },
+    }
+
+    response = requests.post(
+        url,
+        headers=headers,
+        params=params,
+        json=payload,
+        timeout=timeout,
+    )
+    if response.status_code != 200:
+        err_preview = response.text[:200] if response.text else ""
+        raise RuntimeError(f"ElevenLabs HTTP {response.status_code}: {err_preview}")
+
+    pcm_data = response.content
+    if not pcm_data:
+        raise RuntimeError("ElevenLabs returned empty audio data.")
+
+    return pcm16_to_wav_bytes(pcm_data, sample_rate=ELEVENLABS_PCM_SAMPLE_RATE)
 
 
 def ensure_bluetooth_connected(bluetooth_mac: str = "") -> Optional[str]:
@@ -224,28 +287,37 @@ class AudioRecorder:
 
 
 class Speaker:
-    """Thread-safe speaker output supporting Bluetooth (PipeWire/PulseAudio/BlueALSA) and ALSA playback."""
+    """Thread-safe ElevenLabs TTS speaker output supporting Bluetooth and ALSA/macOS playback."""
 
     def __init__(
         self,
         audio_device: str = "default",
         bluetooth_mac: str = "",
+        elevenlabs_api_key: str = "",
+        elevenlabs_voice_id: str = DEFAULT_ELEVENLABS_VOICE_ID,
+        elevenlabs_model_id: str = DEFAULT_ELEVENLABS_MODEL_ID,
         voice: str = "en-us",
         speech_rate: int = 140,
         mock: bool = False,
     ) -> None:
         self.audio_device = audio_device
         self.bluetooth_mac = bluetooth_mac.strip().upper()
+        self.elevenlabs_api_key = elevenlabs_api_key.strip()
+        self.elevenlabs_voice_id = elevenlabs_voice_id.strip() or DEFAULT_ELEVENLABS_VOICE_ID
+        self.elevenlabs_model_id = elevenlabs_model_id.strip() or DEFAULT_ELEVENLABS_MODEL_ID
         self.voice = voice
         self.speech_rate = str(speech_rate)
         self.mock = mock
         self._lock = threading.Lock()
         self._bg_thread: Optional[threading.Thread] = None
+        # In-memory WAV cache for short fixed phrases (e.g. "Let me take a look.") so repeated presses have zero TTS latency
+        self._wav_cache: Dict[str, bytes] = {}
 
         self._has_espeak = shutil.which("espeak-ng") is not None
         self._has_aplay = shutil.which("aplay") is not None
         self._has_paplay = shutil.which("paplay") is not None
         self._has_pw_play = shutil.which("pw-play") is not None
+        self._has_afplay = shutil.which("afplay") is not None
         self._has_say = shutil.which("say") is not None
 
     def connect_bluetooth(self) -> None:
@@ -291,17 +363,25 @@ class Speaker:
 
         with self._lock:
             t0 = time.monotonic()
-            # Always print SPEAK line so terminal users and journalctl logs see what is being spoken
             print(f"SPEAK: {clean_text}", flush=True)
             try:
-                if self._has_espeak:
-                    self._speak_with_espeak_fallbacks(clean_text)
-                elif self._has_say:
-                    self._run_macos_say(clean_text)
+                played = False
+                if self.elevenlabs_api_key:
+                    played = self._speak_with_elevenlabs(clean_text)
                 else:
                     logger.warning(
-                        "espeak-ng is not installed! Run: sudo apt install -y espeak-ng alsa-utils"
+                        "ELEVENLABS_API_KEY is not set; falling back to local TTS (add ELEVENLABS_API_KEY to /etc/memoryaid.env)."
                     )
+
+                if not played:
+                    if self._has_espeak:
+                        self._speak_with_local_espeak(clean_text)
+                    elif self._has_say:
+                        self._run_macos_say(clean_text)
+                    else:
+                        logger.warning(
+                            "No TTS engine available! Set ELEVENLABS_API_KEY or install espeak-ng."
+                        )
             except Exception as exc:
                 logger.error("Speech output failed: %s", exc)
 
@@ -309,19 +389,52 @@ class Speaker:
             logger.info("Spoke (%d chars in %.2fs): %r", len(clean_text), elapsed, clean_text)
             return elapsed
 
-    def _speak_with_espeak_fallbacks(self, text: str) -> None:
-        """Synthesize speech to WAV with espeak-ng, then play it through the first working audio output."""
-        wav_bytes = self._synthesize_wav(text)
-        if not wav_bytes:
-            # Fallback to direct espeak-ng invocation if --stdout failed
-            self._run_espeak_direct(text)
-            return
+    def _speak_with_elevenlabs(self, text: str) -> bool:
+        """Synthesize speech with ElevenLabs (using cache for short common prompts) and play the WAV audio."""
+        try:
+            if len(text) <= 80 and text in self._wav_cache:
+                wav_bytes = self._wav_cache[text]
+            else:
+                wav_bytes = synthesize_elevenlabs_wav(
+                    text=text,
+                    api_key=self.elevenlabs_api_key,
+                    voice_id=self.elevenlabs_voice_id,
+                    model_id=self.elevenlabs_model_id,
+                )
+                if len(text) <= 80 and len(self._wav_cache) < 16:
+                    self._wav_cache[text] = wav_bytes
 
-        # Build ordered list of playback commands to try so Bluetooth works on:
-        # 1. PipeWire / PulseAudio (Bookworm default for Bluetooth speakers)
-        # 2. Configured ALSA device (`default` or `bluealsa`)
-        # 3. Explicit `bluealsa:DEV=<MAC>,PROFILE=a2dp` or `bluealsa`
-        # 4. Direct `espeak-ng` audio output
+            return self._play_wav_bytes(wav_bytes)
+        except Exception as exc:
+            logger.error("ElevenLabs TTS failed (%s); falling back to local TTS.", exc)
+            return False
+
+    def _play_wav_bytes(self, wav_bytes: bytes) -> bool:
+        """Play in-memory WAV bytes through the first working audio output on Pi (Bluetooth/ALSA) or macOS."""
+        # macOS laptop playback via afplay
+        if self._has_afplay and not self._has_aplay and not self._has_paplay and not self._has_pw_play:
+            fd, tmp_wav = tempfile.mkstemp(prefix="memoryaid_tts_", suffix=".wav")
+            os.close(fd)
+            try:
+                Path(tmp_wav).write_bytes(wav_bytes)
+                res = subprocess.run(
+                    ["afplay", tmp_wav],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    timeout=30,
+                    check=False,
+                )
+                return res.returncode == 0
+            finally:
+                try:
+                    os.unlink(tmp_wav)
+                except OSError:
+                    pass
+
+        # Raspberry Pi / Linux playback order:
+        # 1. Explicit non-default AUDIO_DEVICE via aplay
+        # 2. paplay / pw-play (PipeWire / PulseAudio Bluetooth speaker on Raspberry Pi OS Bookworm)
+        # 3. aplay default / bare aplay / bluealsa
         players: List[List[str]] = []
 
         if self.audio_device and self.audio_device != "default" and self._has_aplay:
@@ -353,19 +466,22 @@ class Speaker:
                     check=False,
                 )
                 if res.returncode == 0:
-                    return
+                    return True
                 last_err = (res.stderr or b"").decode("utf-8", errors="replace").strip()
             except Exception as exc:
                 last_err = str(exc)
 
-        logger.warning(
-            "WAV players returned non-zero (last error: %s); falling back to direct espeak-ng.",
-            last_err,
-        )
+        logger.warning("WAV audio players returned non-zero (last error: %s)", last_err)
+        return False
+
+    def _speak_with_local_espeak(self, text: str) -> None:
+        """Fallback local TTS using espeak-ng if ElevenLabs is unconfigured or unreachable."""
+        wav_bytes = self._synthesize_espeak_wav(text)
+        if wav_bytes and self._play_wav_bytes(wav_bytes):
+            return
         self._run_espeak_direct(text)
 
-    def _synthesize_wav(self, text: str) -> bytes:
-        """Run `espeak-ng --stdout` and return the synthesized WAV audio bytes."""
+    def _synthesize_espeak_wav(self, text: str) -> bytes:
         espeak_cmd = [
             "espeak-ng",
             "-v",
@@ -382,8 +498,6 @@ class Speaker:
             check=False,
         )
         if res.returncode != 0 or len(res.stdout) <= 44:
-            err = (res.stderr or b"").decode("utf-8", errors="replace").strip()
-            logger.warning("espeak-ng --stdout failed (code %d): %s", res.returncode, err)
             return b""
         return res.stdout
 

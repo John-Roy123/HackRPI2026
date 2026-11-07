@@ -24,6 +24,7 @@ from memoryaid.app import (
 from memoryaid.camera import CameraError, MockCamera
 from memoryaid.config import Config, load_config
 from memoryaid.memories import PlaceMemory, load_memories, save_recorded_memory
+from memoryaid.speech import pcm16_to_wav_bytes, synthesize_elevenlabs_wav
 from memoryaid.vision import (
     SYSTEM_PROMPT,
     VisionAPIError,
@@ -309,6 +310,8 @@ class TestErrorMappingAndAppLoop(unittest.TestCase):
             env_path = Path(tmp) / "custom.env"
             env_path.write_text(
                 "GEMINI_API_KEY=AIzaSyTest123\n"
+                "ELEVENLABS_API_KEY=el_test_key_456\n"
+                "ELEVENLABS_VOICE_ID=custom_voice_id\n"
                 "MODEL=gemini-2.5-pro\n"
                 "BLUETOOTH_MAC=aa:bb:cc:dd:ee:ff\n"
                 "BUTTON_PIN=17\n"
@@ -320,6 +323,8 @@ class TestErrorMappingAndAppLoop(unittest.TestCase):
             with patch.dict(os.environ, {}, clear=True):
                 cfg = load_config(env_file=env_path, project_root=Path(tmp))
                 self.assertEqual(cfg.gemini_api_key, "AIzaSyTest123")
+                self.assertEqual(cfg.elevenlabs_api_key, "el_test_key_456")
+                self.assertEqual(cfg.elevenlabs_voice_id, "custom_voice_id")
                 self.assertEqual(cfg.model, "gemini-2.5-pro")
                 self.assertEqual(cfg.bluetooth_mac, "AA:BB:CC:DD:EE:FF")
                 self.assertEqual(cfg.audio_device, "bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp")
@@ -327,6 +332,23 @@ class TestErrorMappingAndAppLoop(unittest.TestCase):
                 self.assertEqual(cfg.record_button_pin, 27)
                 self.assertEqual(cfg.speech_rate, 155)
                 self.assertTrue(cfg.save_last_capture)
+
+    @patch("memoryaid.speech.requests.post")
+    def test_elevenlabs_tts_synthesizes_valid_wav(self, mock_post: MagicMock) -> None:
+        fake_pcm = b"\x00\x01" * 1000
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = fake_pcm
+        mock_post.return_value = mock_resp
+
+        wav_bytes = synthesize_elevenlabs_wav(
+            text="You're at Joe's Cafe.",
+            api_key="el_test_key",
+            voice_id="21m00Tcm4TlvDq8ikWAM",
+        )
+        self.assertTrue(wav_bytes.startswith(b"RIFF"))
+        self.assertIn(b"WAVE", wav_bytes[:16])
+        self.assertGreater(len(wav_bytes), len(fake_pcm))
 
     def test_mock_camera_loads_and_resizes_image(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

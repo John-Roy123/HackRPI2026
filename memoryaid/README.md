@@ -171,15 +171,20 @@ exit
 
 *(Note: Once paired and trusted, Memory Aid automatically detects and reconnects to your Bluetooth speaker on startup via `bluetoothctl`. You can also optionally set `BLUETOOTH_MAC=AA:BB:CC:DD:EE:FF` in `/etc/memoryaid.env`.)*
 
-### Add Your Gemini API Key
+### Add Your Gemini & ElevenLabs API Keys
 
-Now add your Google Gemini API key to `/etc/memoryaid.env`:
+Now add your Google Gemini API key and ElevenLabs API key to `/etc/memoryaid.env`:
 
 ```bash
 sudo nano /etc/memoryaid.env
 ```
 
-Set `GEMINI_API_KEY=AIzaSy...` (from [Google AI Studio](https://aistudio.google.com/apikey)), save (`Ctrl+O`, `Enter`, `Ctrl+X`), and restart the service:
+Set:
+- `GEMINI_API_KEY=AIzaSy...` (from [Google AI Studio](https://aistudio.google.com/apikey))
+- `ELEVENLABS_API_KEY=sk_...` (from [ElevenLabs API Keys](https://elevenlabs.io/app/settings/api-keys))
+- *(Optional)* `ELEVENLABS_VOICE_ID=21m00Tcm4TlvDq8ikWAM` (defaults to "Rachel", a calm, warm voice)
+
+Save (`Ctrl+O`, `Enter`, `Ctrl+X`), and restart the service:
 
 ```bash
 sudo systemctl restart memoryaid
@@ -266,6 +271,7 @@ You can run the entire pipeline on your laptop without a Raspberry Pi (`picamera
 2. **Interactive Mock Mode (Enter = "Where am I?", `r` + Enter = "Hold to Record Memory", `q` + Enter = quit)**:
    ```bash
    export GEMINI_API_KEY="AIzaSy..."
+   export ELEVENLABS_API_KEY="sk_..."
    python3 -m memoryaid --mock --image path/to/photo.jpg
    ```
    - Press **Enter** to simulate pressing the **"Where am I?"** button.

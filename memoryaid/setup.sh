@@ -113,7 +113,7 @@ systemctl restart memoryaid.service || true
 echo "==> [7/7] Setup complete!"
 echo ""
 echo "NEXT STEPS:"
-echo "  1. Edit /etc/memoryaid.env and add your GEMINI_API_KEY:"
+echo "  1. Edit /etc/memoryaid.env and add your GEMINI_API_KEY and ELEVENLABS_API_KEY:"
 echo "       sudo nano /etc/memoryaid.env"
 echo "  2. Restart the service:"
 echo "       sudo systemctl restart memoryaid"

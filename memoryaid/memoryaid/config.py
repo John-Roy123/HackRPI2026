@@ -8,6 +8,9 @@ from typing import Dict, Optional
 
 logger = logging.getLogger("memoryaid")
 
+DEFAULT_ELEVENLABS_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # "Rachel" (calm, reassuring voice)
+DEFAULT_ELEVENLABS_MODEL_ID = "eleven_flash_v2_5"
+
 
 def _parse_env_file(path: Path) -> Dict[str, str]:
     """Parse a simple KEY=VALUE environment file without third-party dependencies."""
@@ -55,6 +58,9 @@ class Config:
     """Runtime configuration for Memory Aid."""
 
     gemini_api_key: str = ""
+    elevenlabs_api_key: str = ""
+    elevenlabs_voice_id: str = DEFAULT_ELEVENLABS_VOICE_ID
+    elevenlabs_model_id: str = DEFAULT_ELEVENLABS_MODEL_ID
     model: str = "gemini-2.5-flash"
     bluetooth_mac: str = ""
     audio_device: str = "default"
@@ -70,6 +76,10 @@ class Config:
     @property
     def has_api_key(self) -> bool:
         return bool(self.gemini_api_key and self.gemini_api_key.strip())
+
+    @property
+    def has_elevenlabs_key(self) -> bool:
+        return bool(self.elevenlabs_api_key and self.elevenlabs_api_key.strip())
 
 
 def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = None) -> Config:
@@ -96,6 +106,9 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
 
     for key in (
         "GEMINI_API_KEY",
+        "ELEVENLABS_API_KEY",
+        "ELEVENLABS_VOICE_ID",
+        "ELEVENLABS_MODEL_ID",
         "MODEL",
         "BLUETOOTH_MAC",
         "AUDIO_DEVICE",
@@ -111,6 +124,13 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
             merged[key] = os.environ[key]
 
     api_key = merged.get("GEMINI_API_KEY", "").strip()
+    elevenlabs_api_key = merged.get("ELEVENLABS_API_KEY", "").strip()
+    elevenlabs_voice_id = (
+        merged.get("ELEVENLABS_VOICE_ID", "").strip() or DEFAULT_ELEVENLABS_VOICE_ID
+    )
+    elevenlabs_model_id = (
+        merged.get("ELEVENLABS_MODEL_ID", "").strip() or DEFAULT_ELEVENLABS_MODEL_ID
+    )
     model = merged.get("MODEL", "").strip() or "gemini-2.5-flash"
     bluetooth_mac = merged.get("BLUETOOTH_MAC", "").strip().upper()
     audio_device = merged.get("AUDIO_DEVICE", "").strip()
@@ -141,6 +161,9 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
 
     return Config(
         gemini_api_key=api_key,
+        elevenlabs_api_key=elevenlabs_api_key,
+        elevenlabs_voice_id=elevenlabs_voice_id,
+        elevenlabs_model_id=elevenlabs_model_id,
         model=model,
         bluetooth_mac=bluetooth_mac,
         audio_device=audio_device,
