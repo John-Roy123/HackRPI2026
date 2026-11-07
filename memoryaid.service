@@ -1,0 +1,17 @@
+[Unit]
+Description=Memory Aid - Screenless Camera Companion for Dementia
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__WORKDIR__
+EnvironmentFile=/etc/memoryaid.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m memoryaid
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
