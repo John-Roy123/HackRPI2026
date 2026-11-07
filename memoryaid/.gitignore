@@ -1,0 +1,8 @@
+memoryaid.env
+.cache/
+memories/.cache/
+last_capture.jpg
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store

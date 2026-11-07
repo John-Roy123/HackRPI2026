@@ -74,7 +74,12 @@ class MemoryAidApp:
         self._recorded_photo_b64: Optional[str] = None
 
     def start(self) -> None:
-        """Initialise hardware and play the startup greeting (or setup reminder)."""
+        """Initialise hardware, connect Bluetooth speaker, and play the startup greeting (or setup reminder)."""
+        try:
+            self.speaker.connect_bluetooth()
+        except Exception as exc:
+            logger.warning("Bluetooth speaker connection check failed at startup: %s", exc)
+
         try:
             self.camera.start()
         except Exception as exc:

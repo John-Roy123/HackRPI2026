@@ -8,6 +8,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 TARGET_USER="${SUDO_USER:-$(logname 2>/dev/null || echo pi)}"
+TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null || echo 1000)"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ -f /etc/os-release ]; then
@@ -25,19 +26,29 @@ else
     echo "    Architecture verified: $ARCH"
 fi
 
-echo "==> [2/7] Updating apt and installing required system packages..."
+echo "==> [2/7] Updating apt and installing required system & audio packages..."
 apt-get update
-apt-get install -y --no-install-recommends \
-    python3-picamera2 \
-    python3-gpiozero \
-    python3-lgpio \
-    python3-requests \
-    python3-pil \
-    espeak-ng \
+# Do NOT install bluez-alsa-utils if PipeWire or PulseAudio is already managing Bluetooth audio,
+# because installing bluez-alsa-utils can break an existing working Bluetooth speaker setup.
+BASE_PKGS=(
+    python3-picamera2
+    python3-gpiozero
+    python3-lgpio
+    python3-requests
+    python3-pil
+    espeak-ng
     alsa-utils
+    bluez
+)
+apt-get install -y --no-install-recommends "${BASE_PKGS[@]}"
 
-echo "==> [3/7] Adding user '$TARGET_USER' to hardware access groups (video, gpio, audio)..."
-for grp in video gpio audio; do
+if ! command -v pipewire >/dev/null 2>&1 && ! command -v pulseaudio >/dev/null 2>&1; then
+    echo "    Neither PipeWire nor PulseAudio detected; installing bluez-alsa-utils for headless Bluetooth audio..."
+    apt-get install -y --no-install-recommends bluez-alsa-utils || true
+fi
+
+echo "==> [3/7] Adding user '$TARGET_USER' to hardware access groups (video, gpio, audio, bluetooth)..."
+for grp in video gpio audio bluetooth; do
     if getent group "$grp" >/dev/null; then
         usermod -aG "$grp" "$TARGET_USER"
     else
@@ -45,42 +56,38 @@ for grp in video gpio audio; do
     fi
 done
 
-echo "==> [4/7] Detecting and configuring USB audio dongle..."
-USB_CARD=""
-if command -v aplay >/dev/null 2>&1; then
-    # Match a card line containing USB-Audio or USB Audio
-    USB_CARD="$(aplay -l 2>/dev/null | awk -F'[: ]+' '/^card [0-9]+:.*USB/ {print $2; exit}' || true)"
+# Enable user lingering so user-session PipeWire/PulseAudio stays active for Bluetooth when running headless
+if command -v loginctl >/dev/null 2>&1; then
+    loginctl enable-linger "$TARGET_USER" 2>/dev/null || true
 fi
 
-if [ -n "$USB_CARD" ]; then
-    echo "    Found USB audio device on ALSA card $USB_CARD. Writing /etc/asound.conf..."
-    cat >/etc/asound.conf <<EOF
+echo "==> [4/7] Checking Bluetooth & ALSA audio configuration..."
+if command -v rfkill >/dev/null 2>&1; then
+    rfkill unblock bluetooth || true
+fi
+systemctl enable bluetooth.service >/dev/null 2>&1 || true
+systemctl start bluetooth.service >/dev/null 2>&1 || true
+
+# Only write /etc/asound.conf if bluealsa is actually running AND PipeWire/PulseAudio are not used
+if systemctl is-active --quiet bluealsa 2>/dev/null || systemctl is-active --quiet bluez-alsa 2>/dev/null; then
+    if [ ! -f /etc/asound.conf ]; then
+        echo "    BlueALSA service is active; creating /etc/asound.conf for Bluetooth audio..."
+        cat >/etc/asound.conf <<'EOF'
 pcm.!default {
     type asym
     playback.pcm {
         type plug
-        slave.pcm "hw:${USB_CARD},0"
+        slave.pcm "bluealsa"
     }
     capture.pcm {
         type plug
-        slave.pcm "hw:${USB_CARD},0"
+        slave.pcm "bluealsa:PROFILE=sco"
     }
 }
-ctl.!default {
-    type hw
-    card ${USB_CARD}
-}
 EOF
-    echo "    Setting USB audio playback and microphone volume to ~85%..."
-    for control in Speaker PCM Master Headphone Mic Capture; do
-        if amixer -c "$USB_CARD" scontrols 2>/dev/null | grep -q "'${control}'"; then
-            amixer -c "$USB_CARD" sset "$control" 85% unmute cap >/dev/null 2>&1 || \
-            amixer -c "$USB_CARD" sset "$control" 85% unmute >/dev/null 2>&1 || true
-        fi
-    done
+    fi
 else
-    echo "    WARNING: No USB audio card detected via 'aplay -l'."
-    echo "    Plug in your USB audio dongle via the micro-USB OTG adapter (into the 'USB' port) and re-run sudo ./setup.sh."
+    echo "    Using system default audio routing (PipeWire / PulseAudio / ALSA)."
 fi
 
 echo "==> [5/7] Setting up /etc/memoryaid.env..."
@@ -95,6 +102,7 @@ fi
 
 echo "==> [6/7] Installing and enabling memoryaid.service..."
 sed -e "s|__USER__|${TARGET_USER}|g" \
+    -e "s|__UID__|${TARGET_UID}|g" \
     -e "s|__WORKDIR__|${PROJECT_DIR}|g" \
     "${PROJECT_DIR}/memoryaid.service" >/etc/systemd/system/memoryaid.service
 
@@ -111,5 +119,3 @@ echo "  2. Restart the service:"
 echo "       sudo systemctl restart memoryaid"
 echo "  3. Watch the live logs:"
 echo "       journalctl -u memoryaid -f"
-echo ""
-echo "NOTE: Until you add your GEMINI_API_KEY to /etc/memoryaid.env, the device will speak a reminder that it is not set up yet."

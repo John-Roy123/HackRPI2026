@@ -310,6 +310,7 @@ class TestErrorMappingAndAppLoop(unittest.TestCase):
             env_path.write_text(
                 "GEMINI_API_KEY=AIzaSyTest123\n"
                 "MODEL=gemini-2.5-pro\n"
+                "BLUETOOTH_MAC=aa:bb:cc:dd:ee:ff\n"
                 "BUTTON_PIN=17\n"
                 "RECORD_BUTTON_PIN=27\n"
                 "SPEECH_RATE=155\n"
@@ -320,6 +321,8 @@ class TestErrorMappingAndAppLoop(unittest.TestCase):
                 cfg = load_config(env_file=env_path, project_root=Path(tmp))
                 self.assertEqual(cfg.gemini_api_key, "AIzaSyTest123")
                 self.assertEqual(cfg.model, "gemini-2.5-pro")
+                self.assertEqual(cfg.bluetooth_mac, "AA:BB:CC:DD:EE:FF")
+                self.assertEqual(cfg.audio_device, "bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp")
                 self.assertEqual(cfg.button_pin, 17)
                 self.assertEqual(cfg.record_button_pin, 27)
                 self.assertEqual(cfg.speech_rate, 155)

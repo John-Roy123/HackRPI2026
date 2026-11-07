@@ -91,12 +91,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     speaker = Speaker(
         audio_device=config.audio_device,
+        bluetooth_mac=config.bluetooth_mac,
         voice=config.voice,
         speech_rate=config.speech_rate,
         mock=args.mock,
     )
     recorder = AudioRecorder(
         record_device=config.record_device,
+        bluetooth_mac=config.bluetooth_mac,
         mock=args.mock,
     )
 

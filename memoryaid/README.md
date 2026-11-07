@@ -10,12 +10,11 @@ Memory Aid is a screenless, two-button wearable or handheld camera companion for
 
 Use this exact hardware list:
 
-- **Raspberry Pi Zero W (1st generation)** — ARMv6 single-core 1 GHz, 512 MB RAM, 2.4 GHz Wi-Fi only, with 40-pin GPIO header pins soldered.
+- **Raspberry Pi Zero W (1st generation)** — ARMv6 single-core 1 GHz, 512 MB RAM, 2.4 GHz Wi-Fi + onboard Bluetooth 4.1, with 40-pin GPIO header pins soldered.
 - **Raspberry Pi Camera Module** (v1.3, v2, or v3) connected with the **narrow 22-pin Pi Zero camera ribbon cable** (15-pin on the camera end to 22-pin fine pitch on the Pi Zero end).
 - **Two (2) momentary push buttons** + 4 female-to-female jumper wires (or soldered leads). No resistors required (both use the Pi's internal pull-ups).
-- **Micro-USB OTG adapter** (micro-USB male to USB-A female) — **required** to plug a standard USB audio dongle into the Pi Zero W's data port.
-- **USB audio dongle** (standard plug-and-play USB sound card with 3.5 mm speaker + 3.5 mm microphone jacks, or TRRS headset jack).
-- **Small powered speaker (or headphones) + microphone** plugged into the USB audio dongle.
+- **Bluetooth speaker** (paired directly to the Raspberry Pi Zero W's built-in Bluetooth via `bluez-alsa-utils`).
+  - *(Note: If your Bluetooth speaker has a built-in microphone, Button 1 can record through it; otherwise, you can plug a small USB microphone or USB audio dongle into the Pi Zero W's `USB` data port via a micro-USB OTG adapter.)*
 - **MicroSD card** (8 GB or 16 GB Class 10 / A1 recommended) + card reader for your laptop.
 - **USB power bank** + micro-USB cable for power.
 
@@ -137,7 +136,7 @@ scp -r .\memoryaid pi@memoryaid.local:~/
 
 ---
 
-## 6. Run Setup & Add Your API Key
+## 6. Run Setup, Pair Bluetooth Speaker & Add Your API Key
 
 SSH into the Pi and run the idempotent setup script:
 
@@ -147,6 +146,32 @@ cd ~/memoryaid
 chmod +x setup.sh
 sudo ./setup.sh
 ```
+
+### Pair Your Bluetooth Speaker
+
+Put your Bluetooth speaker into pairing mode, then run `bluetoothctl` on the Pi:
+
+```bash
+bluetoothctl
+```
+
+Inside the `[bluetooth]#` prompt, run these commands (replace `AA:BB:CC:DD:EE:FF` with the MAC address shown for your speaker):
+
+```text
+power on
+agent on
+default-agent
+scan on
+# Wait until your speaker appears, e.g. "Device AA:BB:CC:DD:EE:FF My Speaker"
+pair AA:BB:CC:DD:EE:FF
+trust AA:BB:CC:DD:EE:FF
+connect AA:BB:CC:DD:EE:FF
+exit
+```
+
+*(Note: Once paired and trusted, Memory Aid automatically detects and reconnects to your Bluetooth speaker on startup via `bluetoothctl`. You can also optionally set `BLUETOOTH_MAC=AA:BB:CC:DD:EE:FF` in `/etc/memoryaid.env`.)*
+
+### Add Your Gemini API Key
 
 Now add your Google Gemini API key to `/etc/memoryaid.env`:
 
@@ -175,10 +200,10 @@ Before relying on the full service, you can verify each piece of hardware indivi
    rpicam-still -o test.jpg
    ls -lh test.jpg
    ```
-2. **Test the Audio Output & Microphone**:
+2. **Test the Bluetooth Speaker Output & Microphone**:
    ```bash
-   espeak-ng "hello" --stdout | aplay
-   arecord -f S16_LE -r 16000 -c 1 -d 3 test_mic.wav && aplay test_mic.wav
+   espeak-ng "hello over bluetooth" --stdout | aplay -D bluealsa
+   arecord -f S16_LE -r 16000 -c 1 -d 3 test_mic.wav && aplay -D bluealsa test_mic.wav
    ```
 3. **Test Both Buttons (one-line gpiozero check)**:
    ```bash

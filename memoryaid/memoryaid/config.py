@@ -56,6 +56,7 @@ class Config:
 
     gemini_api_key: str = ""
     model: str = "gemini-2.5-flash"
+    bluetooth_mac: str = ""
     audio_device: str = "default"
     record_device: str = "default"
     voice: str = "en-us"
@@ -96,6 +97,7 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
     for key in (
         "GEMINI_API_KEY",
         "MODEL",
+        "BLUETOOTH_MAC",
         "AUDIO_DEVICE",
         "RECORD_DEVICE",
         "VOICE",
@@ -110,8 +112,17 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
 
     api_key = merged.get("GEMINI_API_KEY", "").strip()
     model = merged.get("MODEL", "").strip() or "gemini-2.5-flash"
-    audio_device = merged.get("AUDIO_DEVICE", "").strip() or "default"
-    record_device = merged.get("RECORD_DEVICE", "").strip() or audio_device
+    bluetooth_mac = merged.get("BLUETOOTH_MAC", "").strip().upper()
+    audio_device = merged.get("AUDIO_DEVICE", "").strip()
+    if not audio_device:
+        if bluetooth_mac:
+            audio_device = f"bluealsa:DEV={bluetooth_mac},PROFILE=a2dp"
+        else:
+            audio_device = "default"
+    elif audio_device == "bluealsa" and bluetooth_mac:
+        audio_device = f"bluealsa:DEV={bluetooth_mac},PROFILE=a2dp"
+
+    record_device = merged.get("RECORD_DEVICE", "").strip() or "default"
     voice = merged.get("VOICE", "").strip() or "en-us"
     speech_rate = _parse_int(merged.get("SPEECH_RATE", "140"), 140, "SPEECH_RATE")
     button_pin = _parse_int(merged.get("BUTTON_PIN", "17"), 17, "BUTTON_PIN")
@@ -131,6 +142,7 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
     return Config(
         gemini_api_key=api_key,
         model=model,
+        bluetooth_mac=bluetooth_mac,
         audio_device=audio_device,
         record_device=record_device,
         voice=voice,
