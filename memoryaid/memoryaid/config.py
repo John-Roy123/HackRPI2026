@@ -8,9 +8,6 @@ from typing import Dict, Optional
 
 logger = logging.getLogger("memoryaid")
 
-DEFAULT_ELEVENLABS_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # "Rachel" (calm, reassuring voice)
-DEFAULT_ELEVENLABS_MODEL_ID = "eleven_flash_v2_5"
-
 
 def _parse_env_file(path: Path) -> Dict[str, str]:
     """Parse a simple KEY=VALUE environment file without third-party dependencies."""
@@ -58,9 +55,9 @@ class Config:
     """Runtime configuration for Memory Aid."""
 
     gemini_api_key: str = ""
-    elevenlabs_api_key: str = ""
-    elevenlabs_voice_id: str = DEFAULT_ELEVENLABS_VOICE_ID
-    elevenlabs_model_id: str = DEFAULT_ELEVENLABS_MODEL_ID
+    fish_api_key: str = ""
+    fish_reference_id: str = ""
+    fish_model: str = ""
     model: str = "gemini-2.5-flash"
     bluetooth_mac: str = ""
     audio_device: str = "default"
@@ -69,6 +66,7 @@ class Config:
     speech_rate: int = 140
     button_pin: int = 17
     record_button_pin: int = 27
+    stream_port: int = 8080
     memories_dir: Path = Path("memories")
     save_last_capture: bool = False
     last_capture_path: Path = Path("last_capture.jpg")
@@ -78,8 +76,8 @@ class Config:
         return bool(self.gemini_api_key and self.gemini_api_key.strip())
 
     @property
-    def has_elevenlabs_key(self) -> bool:
-        return bool(self.elevenlabs_api_key and self.elevenlabs_api_key.strip())
+    def has_fish_key(self) -> bool:
+        return bool(self.fish_api_key and self.fish_api_key.strip())
 
 
 def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = None) -> Config:
@@ -106,9 +104,11 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
 
     for key in (
         "GEMINI_API_KEY",
-        "ELEVENLABS_API_KEY",
-        "ELEVENLABS_VOICE_ID",
-        "ELEVENLABS_MODEL_ID",
+        "FISH_API_KEY",
+        "FISH_AUDIO_API_KEY",
+        "FISH_REFERENCE_ID",
+        "FISH_VOICE_ID",
+        "FISH_MODEL",
         "MODEL",
         "BLUETOOTH_MAC",
         "AUDIO_DEVICE",
@@ -117,6 +117,7 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
         "SPEECH_RATE",
         "BUTTON_PIN",
         "RECORD_BUTTON_PIN",
+        "STREAM_PORT",
         "MEMORIES_DIR",
         "SAVE_LAST_CAPTURE",
     ):
@@ -124,13 +125,15 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
             merged[key] = os.environ[key]
 
     api_key = merged.get("GEMINI_API_KEY", "").strip()
-    elevenlabs_api_key = merged.get("ELEVENLABS_API_KEY", "").strip()
-    elevenlabs_voice_id = (
-        merged.get("ELEVENLABS_VOICE_ID", "").strip() or DEFAULT_ELEVENLABS_VOICE_ID
+    fish_api_key = (
+        merged.get("FISH_API_KEY", "").strip()
+        or merged.get("FISH_AUDIO_API_KEY", "").strip()
     )
-    elevenlabs_model_id = (
-        merged.get("ELEVENLABS_MODEL_ID", "").strip() or DEFAULT_ELEVENLABS_MODEL_ID
+    fish_reference_id = (
+        merged.get("FISH_REFERENCE_ID", "").strip()
+        or merged.get("FISH_VOICE_ID", "").strip()
     )
+    fish_model = merged.get("FISH_MODEL", "").strip()
     model = merged.get("MODEL", "").strip() or "gemini-2.5-flash"
     bluetooth_mac = merged.get("BLUETOOTH_MAC", "").strip().upper()
     audio_device = merged.get("AUDIO_DEVICE", "").strip()
@@ -147,6 +150,7 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
     speech_rate = _parse_int(merged.get("SPEECH_RATE", "140"), 140, "SPEECH_RATE")
     button_pin = _parse_int(merged.get("BUTTON_PIN", "17"), 17, "BUTTON_PIN")
     record_button_pin = _parse_int(merged.get("RECORD_BUTTON_PIN", "27"), 27, "RECORD_BUTTON_PIN")
+    stream_port = _parse_int(merged.get("STREAM_PORT", "8080"), 8080, "STREAM_PORT")
 
     raw_memories_dir = merged.get("MEMORIES_DIR", "").strip()
     if raw_memories_dir:
@@ -161,9 +165,9 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
 
     return Config(
         gemini_api_key=api_key,
-        elevenlabs_api_key=elevenlabs_api_key,
-        elevenlabs_voice_id=elevenlabs_voice_id,
-        elevenlabs_model_id=elevenlabs_model_id,
+        fish_api_key=fish_api_key,
+        fish_reference_id=fish_reference_id,
+        fish_model=fish_model,
         model=model,
         bluetooth_mac=bluetooth_mac,
         audio_device=audio_device,
@@ -172,6 +176,7 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
         speech_rate=speech_rate,
         button_pin=button_pin,
         record_button_pin=record_button_pin,
+        stream_port=stream_port,
         memories_dir=memories_dir,
         save_last_capture=save_last_capture,
         last_capture_path=last_capture_path,

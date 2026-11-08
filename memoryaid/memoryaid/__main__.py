@@ -51,6 +51,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="Optional path to a custom .env configuration file.",
     )
+    parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="Disable the live camera HTTP stream on localhost:8080.",
+    )
+    parser.add_argument(
+        "--no-popup",
+        action="store_true",
+        help="Do not automatically pop up a browser window for the live stream.",
+    )
     return parser.parse_args(argv)
 
 
@@ -92,9 +102,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     speaker = Speaker(
         audio_device=config.audio_device,
         bluetooth_mac=config.bluetooth_mac,
-        elevenlabs_api_key=config.elevenlabs_api_key,
-        elevenlabs_voice_id=config.elevenlabs_voice_id,
-        elevenlabs_model_id=config.elevenlabs_model_id,
+        fish_api_key=config.fish_api_key,
+        fish_reference_id=config.fish_reference_id,
+        fish_model=config.fish_model,
         voice=config.voice,
         speech_rate=config.speech_rate,
         mock=args.mock,
@@ -129,6 +139,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         speaker=speaker,
         recorder=recorder,
         button=None,
+        enable_stream=not args.no_stream,
+        auto_popup_stream=not args.no_popup,
     )
 
     if args.mock:

@@ -1,6 +1,5 @@
-"""ElevenLabs Text-to-Speech (with local fallback) and ALSA microphone recording (`arecord`)."""
+"""Fish Audio Text-to-Speech (`https://api.fish.audio/v1/tts`, with local fallback) and ALSA microphone recording (`arecord`)."""
 
-import io
 import logging
 import os
 import re
@@ -9,21 +8,18 @@ import subprocess
 import tempfile
 import threading
 import time
-import wave
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
-
-from .config import DEFAULT_ELEVENLABS_MODEL_ID, DEFAULT_ELEVENLABS_VOICE_ID
 
 logger = logging.getLogger("memoryaid")
 
 MAX_RECORD_SECONDS = 60
 MAC_REGEX = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
-ELEVENLABS_API_BASE = "https://api.elevenlabs.io/v1/text-to-speech"
-ELEVENLABS_PCM_SAMPLE_RATE = 22050
-ELEVENLABS_TIMEOUT_SECONDS = 20
+FISH_TTS_ENDPOINT = "https://api.fish.audio/v1/tts"
+FISH_SAMPLE_RATE = 24000
+FISH_TIMEOUT_SECONDS = 20
 
 
 class AudioRecordError(Exception):
@@ -42,58 +38,45 @@ def _speech_env() -> dict:
     return env
 
 
-def pcm16_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = ELEVENLABS_PCM_SAMPLE_RATE) -> bytes:
-    """Wrap raw 16-bit little-endian mono PCM bytes into a standard WAV container in memory."""
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)  # 16-bit (2 bytes)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm_bytes)
-    return buf.getvalue()
-
-
-def synthesize_elevenlabs_wav(
+def synthesize_fish_audio_wav(
     text: str,
     api_key: str,
-    voice_id: str = DEFAULT_ELEVENLABS_VOICE_ID,
-    model_id: str = DEFAULT_ELEVENLABS_MODEL_ID,
-    timeout: float = ELEVENLABS_TIMEOUT_SECONDS,
+    reference_id: str = "",
+    fish_model: str = "",
+    timeout: float = FISH_TIMEOUT_SECONDS,
 ) -> bytes:
-    """Call ElevenLabs Text-to-Speech HTTP API (`output_format=pcm_22050`) and return WAV bytes."""
-    url = f"{ELEVENLABS_API_BASE}/{voice_id.strip()}"
-    headers = {
-        "xi-api-key": api_key.strip(),
+    """Call Fish Audio TTS REST API (`https://api.fish.audio/v1/tts`) with `format="wav"` and return WAV bytes."""
+    headers: Dict[str, str] = {
+        "Authorization": f"Bearer {api_key.strip()}",
         "Content-Type": "application/json",
     }
-    params = {
-        "output_format": "pcm_22050",
-    }
-    payload = {
+    if fish_model and fish_model.strip():
+        headers["model"] = fish_model.strip()
+
+    payload: Dict[str, Any] = {
         "text": text,
-        "model_id": model_id.strip() or DEFAULT_ELEVENLABS_MODEL_ID,
-        "voice_settings": {
-            "stability": 0.65,
-            "similarity_boost": 0.75,
-        },
+        "format": "wav",
+        "sample_rate": FISH_SAMPLE_RATE,
+        "latency": "balanced",
     }
+    if reference_id and reference_id.strip():
+        payload["reference_id"] = reference_id.strip()
 
     response = requests.post(
-        url,
+        FISH_TTS_ENDPOINT,
         headers=headers,
-        params=params,
         json=payload,
         timeout=timeout,
     )
     if response.status_code != 200:
         err_preview = response.text[:200] if response.text else ""
-        raise RuntimeError(f"ElevenLabs HTTP {response.status_code}: {err_preview}")
+        raise RuntimeError(f"Fish Audio HTTP {response.status_code}: {err_preview}")
 
-    pcm_data = response.content
-    if not pcm_data:
-        raise RuntimeError("ElevenLabs returned empty audio data.")
+    wav_bytes = response.content
+    if not wav_bytes or len(wav_bytes) <= 44:
+        raise RuntimeError("Fish Audio returned empty WAV audio data.")
 
-    return pcm16_to_wav_bytes(pcm_data, sample_rate=ELEVENLABS_PCM_SAMPLE_RATE)
+    return wav_bytes
 
 
 def ensure_bluetooth_connected(bluetooth_mac: str = "") -> Optional[str]:
@@ -287,24 +270,24 @@ class AudioRecorder:
 
 
 class Speaker:
-    """Thread-safe ElevenLabs TTS speaker output supporting Bluetooth and ALSA/macOS playback."""
+    """Thread-safe Fish Audio TTS speaker output supporting Bluetooth and ALSA/macOS playback."""
 
     def __init__(
         self,
         audio_device: str = "default",
         bluetooth_mac: str = "",
-        elevenlabs_api_key: str = "",
-        elevenlabs_voice_id: str = DEFAULT_ELEVENLABS_VOICE_ID,
-        elevenlabs_model_id: str = DEFAULT_ELEVENLABS_MODEL_ID,
+        fish_api_key: str = "",
+        fish_reference_id: str = "",
+        fish_model: str = "",
         voice: str = "en-us",
         speech_rate: int = 140,
         mock: bool = False,
     ) -> None:
         self.audio_device = audio_device
         self.bluetooth_mac = bluetooth_mac.strip().upper()
-        self.elevenlabs_api_key = elevenlabs_api_key.strip()
-        self.elevenlabs_voice_id = elevenlabs_voice_id.strip() or DEFAULT_ELEVENLABS_VOICE_ID
-        self.elevenlabs_model_id = elevenlabs_model_id.strip() or DEFAULT_ELEVENLABS_MODEL_ID
+        self.fish_api_key = fish_api_key.strip()
+        self.fish_reference_id = fish_reference_id.strip()
+        self.fish_model = fish_model.strip()
         self.voice = voice
         self.speech_rate = str(speech_rate)
         self.mock = mock
@@ -366,11 +349,11 @@ class Speaker:
             print(f"SPEAK: {clean_text}", flush=True)
             try:
                 played = False
-                if self.elevenlabs_api_key:
-                    played = self._speak_with_elevenlabs(clean_text)
+                if self.fish_api_key:
+                    played = self._speak_with_fish_audio(clean_text)
                 else:
                     logger.warning(
-                        "ELEVENLABS_API_KEY is not set; falling back to local TTS (add ELEVENLABS_API_KEY to /etc/memoryaid.env)."
+                        "FISH_API_KEY is not set; falling back to local TTS (add FISH_API_KEY to /etc/memoryaid.env)."
                     )
 
                 if not played:
@@ -380,7 +363,7 @@ class Speaker:
                         self._run_macos_say(clean_text)
                     else:
                         logger.warning(
-                            "No TTS engine available! Set ELEVENLABS_API_KEY or install espeak-ng."
+                            "No TTS engine available! Set FISH_API_KEY or install espeak-ng."
                         )
             except Exception as exc:
                 logger.error("Speech output failed: %s", exc)
@@ -389,24 +372,24 @@ class Speaker:
             logger.info("Spoke (%d chars in %.2fs): %r", len(clean_text), elapsed, clean_text)
             return elapsed
 
-    def _speak_with_elevenlabs(self, text: str) -> bool:
-        """Synthesize speech with ElevenLabs (using cache for short common prompts) and play the WAV audio."""
+    def _speak_with_fish_audio(self, text: str) -> bool:
+        """Synthesize speech with Fish Audio (using cache for short common prompts) and play the WAV audio."""
         try:
             if len(text) <= 80 and text in self._wav_cache:
                 wav_bytes = self._wav_cache[text]
             else:
-                wav_bytes = synthesize_elevenlabs_wav(
+                wav_bytes = synthesize_fish_audio_wav(
                     text=text,
-                    api_key=self.elevenlabs_api_key,
-                    voice_id=self.elevenlabs_voice_id,
-                    model_id=self.elevenlabs_model_id,
+                    api_key=self.fish_api_key,
+                    reference_id=self.fish_reference_id,
+                    fish_model=self.fish_model,
                 )
                 if len(text) <= 80 and len(self._wav_cache) < 16:
                     self._wav_cache[text] = wav_bytes
 
             return self._play_wav_bytes(wav_bytes)
         except Exception as exc:
-            logger.error("ElevenLabs TTS failed (%s); falling back to local TTS.", exc)
+            logger.error("Fish Audio TTS failed (%s); falling back to local TTS.", exc)
             return False
 
     def _play_wav_bytes(self, wav_bytes: bytes) -> bool:
@@ -475,7 +458,7 @@ class Speaker:
         return False
 
     def _speak_with_local_espeak(self, text: str) -> None:
-        """Fallback local TTS using espeak-ng if ElevenLabs is unconfigured or unreachable."""
+        """Fallback local TTS using espeak-ng if Fish Audio is unconfigured or unreachable."""
         wav_bytes = self._synthesize_espeak_wav(text)
         if wav_bytes and self._play_wav_bytes(wav_bytes):
             return

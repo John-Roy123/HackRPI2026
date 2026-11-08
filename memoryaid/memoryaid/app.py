@@ -9,6 +9,7 @@ from .camera import CameraError
 from .config import Config
 from .memories import PlaceMemory, load_memories, save_recorded_memory
 from .speech import AudioRecordError, AudioRecorder, Speaker
+from .stream import CameraStreamServer
 from .vision import (
     VisionAPIError,
     build_messages_payload,
@@ -62,6 +63,8 @@ class MemoryAidApp:
         speaker: Speaker,
         recorder: Optional[AudioRecorder] = None,
         button: Optional[ButtonProtocol] = None,
+        enable_stream: bool = False,
+        auto_popup_stream: bool = False,
     ) -> None:
         self.config = config
         self.places = places
@@ -69,12 +72,15 @@ class MemoryAidApp:
         self.speaker = speaker
         self.recorder = recorder or AudioRecorder(record_device=config.record_device)
         self.button = button
+        self.enable_stream = enable_stream
+        self.auto_popup_stream = auto_popup_stream
+        self.stream_server: Optional[CameraStreamServer] = None
         self._busy_lock = threading.Lock()
         self._recording_active = False
         self._recorded_photo_b64: Optional[str] = None
 
     def start(self) -> None:
-        """Initialise hardware, connect Bluetooth speaker, and play the startup greeting (or setup reminder)."""
+        """Initialise hardware, start live camera stream on localhost:8080, and play the startup greeting."""
         try:
             self.speaker.connect_bluetooth()
         except Exception as exc:
@@ -84,6 +90,15 @@ class MemoryAidApp:
             self.camera.start()
         except Exception as exc:
             logger.error("Camera initialisation failed at startup: %s", exc)
+
+        if self.enable_stream and self.config.stream_port > 0:
+            self.stream_server = CameraStreamServer(
+                camera=self.camera,
+                port=self.config.stream_port,
+                fps=5.0,
+                on_identify_press=self.handle_button_press,
+            )
+            self.stream_server.start(auto_popup=self.auto_popup_stream)
 
         if self.button is not None:
             self.button.start()
@@ -296,6 +311,9 @@ class MemoryAidApp:
         return size_bytes
 
     def close(self) -> None:
+        if self.stream_server is not None:
+            self.stream_server.close()
+            self.stream_server = None
         if self.button is not None:
             self.button.close()
         self.camera.close()
