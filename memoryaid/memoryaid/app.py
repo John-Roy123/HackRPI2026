@@ -7,7 +7,7 @@ from typing import List, Optional, Protocol
 
 from .camera import CameraError
 from .config import Config
-from .memories import PlaceMemory, load_memories, save_recorded_memory
+from .memories import PlaceMemory, build_contact_sheet_b64, load_memories, save_recorded_memory
 from .speech import AudioRecordError, AudioRecorder, Speaker
 from .vision import (
     VisionAPIError,
@@ -72,6 +72,9 @@ class MemoryAidApp:
         self._busy_lock = threading.Lock()
         self._recording_active = False
         self._recorded_photo_b64: Optional[str] = None
+        self.contact_sheet_b64: Optional[str] = build_contact_sheet_b64(
+            self.places, cache_dir=self.config.memories_dir / ".cache"
+        )
 
     def start(self) -> None:
         """Initialise hardware, connect Bluetooth speaker, and play the startup greeting."""
@@ -148,6 +151,7 @@ class MemoryAidApp:
             places=self.places,
             captured_b64=captured_b64,
             model=self.config.model,
+            contact_sheet_b64=self.contact_sheet_b64,
         )
         prep_sec = time.monotonic() - t_prep_start
 
@@ -278,8 +282,11 @@ class MemoryAidApp:
             captured_b64=photo_b64,
             note_text=note_text,
         )
-        # Reload places from disk so the newly recorded place is immediately active
+        # Reload places and rebuild the composite contact sheet so the new place is immediately active
         self.places = load_memories(self.config.memories_dir)
+        self.contact_sheet_b64 = build_contact_sheet_b64(
+            self.places, cache_dir=self.config.memories_dir / ".cache"
+        )
         return saved_place
 
     def run_dry_run(self) -> int:
@@ -290,6 +297,7 @@ class MemoryAidApp:
             places=self.places,
             captured_b64=captured_b64,
             model=self.config.model,
+            contact_sheet_b64=self.contact_sheet_b64,
         )
         size_bytes, summary = summarize_payload(payload, self.places, model=self.config.model)
         print(summary, flush=True)

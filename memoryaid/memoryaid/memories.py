@@ -1,17 +1,18 @@
-"""Memory book loading, saving new recorded places, reference image preprocessing, and disk caching."""
+"""Memory book loading, saving new recorded places, contact-sheet composite grid, and disk caching."""
 
 import base64
 import hashlib
 import io
 import json
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set, Tuple
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageOps
 
 logger = logging.getLogger("memoryaid")
 
@@ -20,6 +21,9 @@ MAX_PLACES = 10
 MAX_PHOTOS_PER_PLACE = 2
 REF_MAX_EDGE = 512
 REF_JPEG_QUALITY = 75
+GRID_TILE_WIDTH = 320
+GRID_TILE_HEIGHT = 240
+GRID_JPEG_QUALITY = 78
 
 
 @dataclass
@@ -61,6 +65,104 @@ def preprocess_image_file_to_b64(
     return base64.b64encode(jpeg_bytes).decode("ascii")
 
 
+def build_contact_sheet_b64(
+    places: List[PlaceMemory],
+    cache_dir: Optional[Path] = None,
+) -> Optional[str]:
+    """Stitch all reference photos across `places` into a single labeled contact-sheet grid JPEG (base64).
+
+    Each tile is labeled in the top-left corner with `#<place_index> <place_name>` (e.g., `#1 joes_cafe`).
+    Returns None if no place has any reference photos.
+    """
+    tiles: List[Tuple[int, str, str]] = []
+    for place_idx, place in enumerate(places, start=1):
+        for img_b64 in place.images_b64:
+            tiles.append((place_idx, place.name, img_b64))
+
+    if not tiles:
+        return None
+
+    # Compute a fingerprint over all tile base64 strings + labels so we can reuse the cached grid on disk
+    sig_hasher = hashlib.sha256()
+    for place_idx, place_name, img_b64 in tiles:
+        sig_hasher.update(f"{place_idx}:{place_name}:".encode("utf-8"))
+        sig_hasher.update(img_b64.encode("ascii"))
+    grid_sig = sig_hasher.hexdigest()[:24]
+
+    if cache_dir is not None:
+        grid_cache_file = cache_dir / f"contact_sheet_{grid_sig}.json"
+        if grid_cache_file.is_file():
+            try:
+                cached = json.loads(grid_cache_file.read_text(encoding="utf-8"))
+                if isinstance(cached.get("b64"), str) and cached["b64"]:
+                    return str(cached["b64"])
+            except Exception:
+                pass
+
+    num_tiles = len(tiles)
+    cols = min(4, max(1, int(math.ceil(math.sqrt(num_tiles)))))
+    rows = int(math.ceil(num_tiles / float(cols)))
+
+    canvas_w = cols * GRID_TILE_WIDTH
+    canvas_h = rows * GRID_TILE_HEIGHT
+    sheet = Image.new("RGB", (canvas_w, canvas_h), color=(20, 24, 32))
+    resample = getattr(Image, "Resampling", Image).LANCZOS
+
+    for idx, (place_idx, place_name, img_b64) in enumerate(tiles):
+        col = idx % cols
+        row = idx // cols
+        x0 = col * GRID_TILE_WIDTH
+        y0 = row * GRID_TILE_HEIGHT
+
+        try:
+            raw = base64.b64decode(img_b64)
+            with Image.open(io.BytesIO(raw)) as tile_img:
+                fitted = ImageOps.fit(
+                    tile_img.convert("RGB"),
+                    (GRID_TILE_WIDTH - 4, GRID_TILE_HEIGHT - 4),
+                    method=resample,
+                )
+                sheet.paste(fitted, (x0 + 2, y0 + 2))
+        except Exception as exc:
+            logger.warning("Could not render contact-sheet tile for %s: %s", place_name, exc)
+
+        # Draw high-contrast label banner `#N place_name` at the top-left of the tile
+        draw = ImageDraw.Draw(sheet)
+        label = f"#{place_idx} {place_name}"[:28]
+        banner_w = min(GRID_TILE_WIDTH - 4, max(70, len(label) * 7 + 12))
+        draw.rectangle([x0 + 2, y0 + 2, x0 + 2 + banner_w, y0 + 22], fill=(0, 0, 0))
+        draw.text((x0 + 8, y0 + 6), label, fill=(255, 255, 100))
+
+    buf = io.BytesIO()
+    sheet.save(buf, format="JPEG", quality=GRID_JPEG_QUALITY, optimize=True)
+    sheet_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+    if cache_dir is not None:
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            # Remove older contact_sheet_*.json files
+            for old_sheet in cache_dir.glob("contact_sheet_*.json"):
+                try:
+                    old_sheet.unlink()
+                except OSError:
+                    pass
+            (cache_dir / f"contact_sheet_{grid_sig}.json").write_text(
+                json.dumps({"tiles": num_tiles, "b64": sheet_b64}),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    logger.info(
+        "Built composite contact-sheet grid (%d tile(s) across %dx%d grid, %.1f KB).",
+        num_tiles,
+        cols,
+        rows,
+        len(buf.getvalue()) / 1024.0,
+    )
+    return sheet_b64
+
+
 def slugify_place_name(text: str) -> str:
     """Create a filesystem-safe folder slug from a spoken note or place name."""
     cleaned = text.lower().replace("'", "").replace("\u2019", "")
@@ -90,7 +192,6 @@ def save_recorded_memory(
     slug = slugify_place_name(place_name_hint or note_text)
     place_dir = memories_dir / slug
 
-    # If the folder already has 2 photos and a different note, create a uniquely numbered folder
     if place_dir.exists():
         existing_photos = sorted(
             [
@@ -105,19 +206,16 @@ def save_recorded_memory(
 
     place_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write note.txt
     note_path = place_dir / "note.txt"
     clean_note = note_text.strip()
     note_path.write_text(clean_note + "\n", encoding="utf-8")
 
-    # Decode the captured JPEG and save as 1.jpg (or 2.jpg)
     raw_jpeg = base64.b64decode(captured_b64)
     photo_1 = place_dir / "1.jpg"
     photo_2 = place_dir / "2.jpg"
     target_photo = photo_2 if photo_1.exists() else photo_1
     target_photo.write_bytes(raw_jpeg)
 
-    # Also append to a master log file `memories/recorded_notes.txt` so every entry is easily readable in one file
     log_file = memories_dir / "recorded_notes.txt"
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     with log_file.open("a", encoding="utf-8") as f:
@@ -282,7 +380,7 @@ def load_memories(memories_dir: Path) -> List[PlaceMemory]:
     # Prune stale cache entries so removed photos do not linger on disk
     if cache_dir.is_dir():
         for cached_file in cache_dir.glob("*.json"):
-            if cached_file.stem not in active_cache_keys:
+            if not cached_file.stem.startswith("contact_sheet_") and cached_file.stem not in active_cache_keys:
                 try:
                     cached_file.unlink()
                 except OSError:

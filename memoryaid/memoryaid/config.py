@@ -58,7 +58,7 @@ class Config:
     fish_api_key: str = ""
     fish_reference_id: str = ""
     fish_model: str = ""
-    model: str = "gemini-2.5-flash"
+    model: str = "gemini-3-flash-preview"
     bluetooth_mac: str = ""
     audio_device: str = "default"
     record_device: str = "auto"
@@ -132,13 +132,13 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
         or merged.get("FISH_VOICE_ID", "").strip()
     )
     fish_model = merged.get("FISH_MODEL", "").strip()
-    model = merged.get("MODEL", "").strip() or "gemini-2.5-flash"
-    if model.lower().startswith("claude"):
-        logger.warning(
-            "Found legacy Anthropic MODEL=%r in env file; overriding with 'gemini-2.5-flash'.",
+    model = merged.get("MODEL", "").strip() or "gemini-3-flash-preview"
+    if model.lower().startswith("claude") or model in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"):
+        logger.info(
+            "Upgrading MODEL=%r to 'gemini-3-flash-preview' (active on new Gemini API keys).",
             model,
         )
-        model = "gemini-2.5-flash"
+        model = "gemini-3-flash-preview"
     bluetooth_mac = merged.get("BLUETOOTH_MAC", "").strip().upper()
     audio_device = merged.get("AUDIO_DEVICE", "").strip()
     if not audio_device:

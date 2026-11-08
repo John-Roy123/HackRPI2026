@@ -150,9 +150,12 @@ class TestVisionPayloadAndCleaning(unittest.TestCase):
     """Tests for Gemini API payload structure, transcription payload, markdown stripping, and HTTP retry logic."""
 
     def test_request_payload_structure_order(self) -> None:
+        ref1 = _create_dummy_jpeg_b64((320, 240), (200, 50, 50))
+        ref2 = _create_dummy_jpeg_b64((320, 240), (50, 200, 50))
+        ref3 = _create_dummy_jpeg_b64((320, 240), (50, 50, 200))
         places = [
-            PlaceMemory(name="joes_cafe", note="Coffee with Maria.", images_b64=["REF_IMG_1", "REF_IMG_2"]),
-            PlaceMemory(name="davids_bedroom", note="David is your son.", images_b64=["REF_IMG_3"]),
+            PlaceMemory(name="joes_cafe", note="Coffee with Maria.", images_b64=[ref1, ref2]),
+            PlaceMemory(name="davids_bedroom", note="David is your son.", images_b64=[ref3]),
         ]
         payload = build_messages_payload(places=places, captured_b64="NEW_CAM_B64", model="gemini-2.5-flash")
 
@@ -160,27 +163,32 @@ class TestVisionPayloadAndCleaning(unittest.TestCase):
             get_gemini_endpoint("gemini-2.5-flash"),
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
         )
+        self.assertEqual(
+            get_gemini_endpoint("claude-haiku-5-5"),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent",
+        )
         self.assertEqual(payload["generationConfig"]["maxOutputTokens"], 200)
         self.assertEqual(payload["system_instruction"]["parts"][0]["text"], SYSTEM_PROMPT)
         self.assertEqual(len(payload["contents"]), 1)
         self.assertEqual(payload["contents"][0]["role"], "user")
 
         parts = payload["contents"][0]["parts"]
-        self.assertEqual(len(parts), 8)
-        self.assertEqual(
-            parts[0],
-            {"text": "Known place 1: joes_cafe\nCaregiver note: Coffee with Maria."},
-        )
-        self.assertEqual(parts[1]["inline_data"]["data"], "REF_IMG_1")
-        self.assertEqual(parts[2]["inline_data"]["data"], "REF_IMG_2")
-        self.assertEqual(
-            parts[3],
-            {"text": "Known place 2: davids_bedroom\nCaregiver note: David is your son."},
-        )
-        self.assertEqual(parts[4]["inline_data"]["data"], "REF_IMG_3")
-        self.assertEqual(parts[5], {"text": "NEW photo from the camera right now:"})
-        self.assertEqual(parts[6]["inline_data"]["data"], "NEW_CAM_B64")
-        self.assertEqual(parts[7], {"text": "Where am I?"})
+        # Expected sequence with Option 2 Contact Sheet:
+        # 0: text (Known places list)
+        # 1: text (Reference Contact Sheet header)
+        # 2: inline_data (Single stitched Contact Sheet image containing all 3 reference photos)
+        # 3: text ("NEW photo from the camera right now:")
+        # 4: inline_data (NEW_CAM_B64)
+        # 5: text (Comparison instruction)
+        self.assertEqual(len(parts), 6)
+        self.assertIn("#1 (joes_cafe): Coffee with Maria.", parts[0]["text"])
+        self.assertIn("#2 (davids_bedroom): David is your son.", parts[0]["text"])
+        self.assertIn("Reference Contact Sheet", parts[1]["text"])
+        self.assertEqual(parts[2]["inline_data"]["mime_type"], "image/jpeg")
+        self.assertGreater(len(parts[2]["inline_data"]["data"]), 100)
+        self.assertEqual(parts[3], {"text": "NEW photo from the camera right now:"})
+        self.assertEqual(parts[4]["inline_data"]["data"], "NEW_CAM_B64")
+        self.assertIn("exclusively the matching caregiver note", parts[5]["text"])
 
     def test_transcription_payload_structure(self) -> None:
         payload = build_transcription_payload(wav_bytes=b"RIFF_FAKE_WAV", captured_b64="ROOM_B64")
@@ -201,14 +209,15 @@ class TestVisionPayloadAndCleaning(unittest.TestCase):
     def test_query_vision_api_falls_back_on_404_or_claude_model_name(self, mock_post: MagicMock, mock_get: MagicMock) -> None:
         import memoryaid.vision as vision_mod
         vision_mod._DISCOVERED_MODEL = ""
+        vision_mod._FAILED_404_MODELS.clear()
         mock_get_resp = MagicMock()
         mock_get_resp.status_code = 200
-        mock_get_resp.json.return_value = {"models": [{"name": "models/gemini-2.0-flash", "supportedGenerationMethods": ["generateContent"]}]}
+        mock_get_resp.json.return_value = {"models": [{"name": "models/gemini-flash-latest", "supportedGenerationMethods": ["generateContent"]}]}
         mock_get.return_value = mock_get_resp
 
         resp_404 = MagicMock()
         resp_404.status_code = 404
-        resp_404.text = "models/gemini-2.5-flash not found"
+        resp_404.text = "models/gemini-3-flash-preview not found"
 
         resp_200 = MagicMock()
         resp_200.status_code = 200
@@ -231,6 +240,7 @@ class TestVisionPayloadAndCleaning(unittest.TestCase):
         self.assertEqual(text, "You're in David's bedroom.")
         self.assertEqual(mock_post.call_count, 2)
         vision_mod._DISCOVERED_MODEL = ""
+        vision_mod._FAILED_404_MODELS.clear()
 
     @patch("memoryaid.vision.requests.post")
     def test_query_vision_api_fails_after_retry_on_network_error(self, mock_post: MagicMock) -> None:

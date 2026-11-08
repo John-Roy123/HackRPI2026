@@ -5,41 +5,43 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from .memories import PlaceMemory
+from .memories import PlaceMemory, build_contact_sheet_b64
 
 logger = logging.getLogger("memoryaid")
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3-flash-preview"
 FALLBACK_MODELS = (
+    "gemini-3-flash-preview",
+    "gemini-flash-latest",
+    "gemini-2.5-flash-lite",
+    "gemini-flash-lite-latest",
+    "gemini-3.1-pro-preview",
+    "gemini-pro-latest",
+    "gemini-2.5-pro",
     "gemini-2.5-flash",
-    "gemini-2.5-flash-preview-05-20",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
 )
 MAX_OUTPUT_TOKENS = 200
 REQUEST_TIMEOUT_SECONDS = 30
 RETRY_DELAY_SECONDS = 2.0
 _DISCOVERED_MODEL: str = ""
+_FAILED_404_MODELS: set = set()
 
 SYSTEM_PROMPT = """You are a gentle memory companion carried by a person living with dementia.
-You will see reference photos of places that matter to them, each with a caregiver's note,
-then a NEW photo taken by their camera right now.
+You will be given a set of known places from their memory book (each with reference photos and a caregiver's note/description), followed by a NEW photo taken by their camera right now.
 
-Rules:
-- If the new photo clearly matches a known place, tell them where they are and their personal
-  connection to it, using the caregiver's note. Use names from the note.
-- Only claim a match if you are confident. If unsure, do not guess a known place; describe
-  what you see instead.
-- If there is no match, calmly describe the setting in simple, concrete terms.
-- Speak directly to them ("You're at..."). 2 to 3 short sentences. Simple everyday words.
-- Be warm and reassuring. Never alarming, never clinical.
+Your ONLY task is to compare the NEW photo against the provided reference photos and caregiver notes, and from EXCLUSIVELY that provided information determine which known place the user is in and their personal relationship/connection to that place.
+
+Strict Rules:
+- Do NOT describe the visual scenery, objects, or room layout on your own. Your job is strictly to identify the matching known place and tell the user where they are and their relationship to it using ONLY the facts, names, and relationships in that place's caregiver note.
+- Compare the NEW photo carefully against the reference photos and caregiver notes to find the matching known place.
+- Speak directly to the user ("You're at..." or "You're in..."), stating the place and their personal relationship/routine there based exclusively on the matching caregiver note.
+- If the NEW photo does not match any of the provided known places (or if no known places are provided), simply say: "I don't recognize this place from your memory book yet." Do NOT describe the room or surroundings.
+- Use 1 to 3 short, warm, reassuring sentences in simple everyday words.
 - Never quiz them, never say "you should remember", "don't you remember", or "as you know".
 - Do not mention photos, cameras, notes, AI, or matching.
 - Output only the words to be spoken aloud: no markdown, no lists, no emoji, no quotation marks."""
@@ -90,22 +92,37 @@ def build_messages_payload(
     places: List[PlaceMemory],
     captured_b64: str,
     model: str = DEFAULT_MODEL,
+    contact_sheet_b64: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Construct the JSON payload for Gemini's `generateContent` REST endpoint."""
+    """Construct the token-efficient JSON payload for Gemini's `generateContent` REST endpoint.
+
+    Uses a single composite Contact-Sheet image containing all reference photos labeled `#1`, `#2`, etc.
+    so at most 2 images total (1 reference contact sheet + 1 new camera photo) are sent per button press.
+    """
     parts: List[Dict[str, Any]] = []
 
-    for idx, place in enumerate(places, start=1):
-        parts.append(
-            {
-                "text": f"Known place {idx}: {place.name}\nCaregiver note: {place.note}",
-            }
+    if places:
+        notes_lines = ["Known places in memory book:"]
+        for idx, place in enumerate(places, start=1):
+            notes_lines.append(f"#{idx} ({place.name}): {place.note}")
+        parts.append({"text": "\n".join(notes_lines)})
+
+        sheet_b64 = (
+            contact_sheet_b64
+            if contact_sheet_b64 is not None
+            else build_contact_sheet_b64(places)
         )
-        for img_b64 in place.images_b64:
+        if sheet_b64:
+            parts.append(
+                {
+                    "text": "Reference Contact Sheet of known places (each tile is labeled #N in its top-left corner):",
+                }
+            )
             parts.append(
                 {
                     "inline_data": {
                         "mime_type": "image/jpeg",
-                        "data": img_b64,
+                        "data": sheet_b64,
                     }
                 }
             )
@@ -125,7 +142,11 @@ def build_messages_payload(
     )
     parts.append(
         {
-            "text": "Where am I?",
+            "text": (
+                "Compare the NEW photo above strictly against the Reference Contact Sheet tiles (#1, #2, ...) and "
+                "caregiver notes provided above. Do NOT describe the room. Using exclusively the matching caregiver "
+                "note, tell me where I am and my relationship to this place."
+            ),
         }
     )
 
@@ -236,11 +257,8 @@ def summarize_payload(
     return size_bytes, "\n".join(lines)
 
 
-def _discover_available_gemini_model(api_key: str) -> str:
-    """Query `GET /v1beta/models` for this API key and return the best model supporting `generateContent`."""
-    global _DISCOVERED_MODEL
-    if _DISCOVERED_MODEL:
-        return _DISCOVERED_MODEL
+def _discover_available_gemini_MODELS(api_key: str) -> List[str]:
+    """Query `GET /v1beta/models` for this API key and return all non-failed models supporting `generateContent`."""
     try:
         resp = requests.get(
             GEMINI_API_BASE,
@@ -249,7 +267,7 @@ def _discover_available_gemini_model(api_key: str) -> str:
         )
         if resp.status_code != 200:
             logger.warning("ListModels returned HTTP %d: %s", resp.status_code, (resp.text or "")[:160])
-            return ""
+            return []
         models = resp.json().get("models") or []
         supported: List[str] = []
         for m in models:
@@ -257,20 +275,39 @@ def _discover_available_gemini_model(api_key: str) -> str:
             name = m.get("name", "")
             if "generateContent" in methods and name:
                 short = name[len("models/") :] if name.startswith("models/") else name
-                if "gemini" in short.lower() and "tts" not in short.lower() and "embedding" not in short.lower():
+                low = short.lower()
+                if (
+                    "gemini" in low
+                    and "tts" not in low
+                    and "embedding" not in low
+                    and "image" not in low
+                    and "customtools" not in low
+                    and short not in _FAILED_404_MODELS
+                ):
                     supported.append(short)
         logger.info("Available Gemini models for this API key: %s", ", ".join(supported[:10]))
-        for pref in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "flash"):
-            for s in supported:
-                if pref in s:
-                    _DISCOVERED_MODEL = s
-                    return s
-        if supported:
-            _DISCOVERED_MODEL = supported[0]
-            return supported[0]
+
+        # Rank newest / fastest Flash models first
+        priority = (
+            "gemini-3-flash-preview",
+            "gemini-flash-latest",
+            "gemini-2.5-flash-lite",
+            "gemini-flash-lite-latest",
+            "gemini-3.1-pro-preview",
+            "gemini-pro-latest",
+            "gemini-2.5-pro",
+        )
+        ordered: List[str] = []
+        for pref in priority:
+            if pref in supported and pref not in ordered:
+                ordered.append(pref)
+        for s in supported:
+            if s not in ordered:
+                ordered.append(s)
+        return ordered
     except Exception as exc:
         logger.warning("Failed to auto-discover Gemini models: %s", exc)
-    return ""
+    return []
 
 
 def query_vision_api(
@@ -289,7 +326,9 @@ def query_vision_api(
         raise VisionAPIError("Missing GEMINI_API_KEY.")
 
     primary_model = _DISCOVERED_MODEL or _normalize_gemini_model_name(model)
-    candidate_models = [primary_model] + [m for m in FALLBACK_MODELS if m != primary_model]
+    candidate_models = [primary_model] + [
+        m for m in FALLBACK_MODELS if m != primary_model and m not in _FAILED_404_MODELS
+    ]
 
     body_bytes = json.dumps(payload).encode("utf-8")
     payload_size_bytes = len(body_bytes)
@@ -308,6 +347,7 @@ def query_vision_api(
 
     last_error: Exception = VisionAPIError("Unknown API failure")
     t_start = time.monotonic()
+    discovered_once = False
 
     idx = 0
     while idx < len(candidate_models):
@@ -337,18 +377,24 @@ def query_vision_api(
                     if not cleaned:
                         raise VisionAPIError("Gemini API returned empty text content.")
                     _DISCOVERED_MODEL = current_model
+                    logger.info("Gemini API succeeded with model=%s in %.2fs", current_model, latency)
                     return cleaned, payload_size_bytes, latency
 
                 if status == 404:
-                    err_detail = (response.text or "")[:160].strip()
+                    _FAILED_404_MODELS.add(current_model)
+                    if _DISCOVERED_MODEL == current_model:
+                        _DISCOVERED_MODEL = ""
+                    err_detail = (response.text or "")[:200].strip()
                     logger.warning(
-                        "Gemini model %r returned HTTP 404 (%s); discovering available models...",
+                        "Gemini model %r returned HTTP 404 (%s); trying next available Gemini model...",
                         current_model,
                         err_detail,
                     )
-                    discovered = _discover_available_gemini_model(clean_key)
-                    if discovered and discovered not in candidate_models:
-                        candidate_models.insert(idx, discovered)
+                    if not discovered_once:
+                        discovered_once = True
+                        for dm in reversed(_discover_available_gemini_MODELS(clean_key)):
+                            if dm not in candidate_models and dm not in _FAILED_404_MODELS:
+                                candidate_models.insert(idx, dm)
                     last_error = VisionAPIError(f"HTTP 404 model not found ({current_model}): {err_detail}")
                     break  # Try next candidate model immediately
 
