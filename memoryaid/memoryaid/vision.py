@@ -15,9 +15,18 @@ logger = logging.getLogger("memoryaid")
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 DEFAULT_MODEL = "gemini-2.5-flash"
+FALLBACK_MODELS = (
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-preview-05-20",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+)
 MAX_OUTPUT_TOKENS = 200
 REQUEST_TIMEOUT_SECONDS = 30
 RETRY_DELAY_SECONDS = 2.0
+_DISCOVERED_MODEL: str = ""
 
 SYSTEM_PROMPT = """You are a gentle memory companion carried by a person living with dementia.
 You will see reference photos of places that matter to them, each with a caregiver's note,
@@ -58,10 +67,23 @@ def clean_spoken_text(text: str) -> str:
 
 def get_gemini_endpoint(model: str = DEFAULT_MODEL) -> str:
     """Return the REST generateContent URL for the configured Gemini model."""
-    clean_model = model.strip()
-    if clean_model.startswith("models/"):
-        clean_model = clean_model[len("models/") :]
+    clean_model = _normalize_gemini_model_name(model)
     return f"{GEMINI_API_BASE}/{clean_model}:generateContent"
+
+
+def _normalize_gemini_model_name(model: str) -> str:
+    """Normalize common model names (e.g. legacy Claude names in old .env files) to a valid Gemini model."""
+    clean = (model or "").strip()
+    if clean.startswith("models/"):
+        clean = clean[len("models/") :]
+    if not clean or clean.lower().startswith("claude"):
+        logger.warning(
+            "Configured MODEL=%r is not a Gemini model; automatically using %r instead.",
+            model,
+            DEFAULT_MODEL,
+        )
+        return DEFAULT_MODEL
+    return clean
 
 
 def build_messages_payload(
@@ -214,6 +236,43 @@ def summarize_payload(
     return size_bytes, "\n".join(lines)
 
 
+def _discover_available_gemini_model(api_key: str) -> str:
+    """Query `GET /v1beta/models` for this API key and return the best model supporting `generateContent`."""
+    global _DISCOVERED_MODEL
+    if _DISCOVERED_MODEL:
+        return _DISCOVERED_MODEL
+    try:
+        resp = requests.get(
+            GEMINI_API_BASE,
+            params={"key": api_key.strip()},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.warning("ListModels returned HTTP %d: %s", resp.status_code, (resp.text or "")[:160])
+            return ""
+        models = resp.json().get("models") or []
+        supported: List[str] = []
+        for m in models:
+            methods = m.get("supportedGenerationMethods") or []
+            name = m.get("name", "")
+            if "generateContent" in methods and name:
+                short = name[len("models/") :] if name.startswith("models/") else name
+                if "gemini" in short.lower() and "tts" not in short.lower() and "embedding" not in short.lower():
+                    supported.append(short)
+        logger.info("Available Gemini models for this API key: %s", ", ".join(supported[:10]))
+        for pref in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "flash"):
+            for s in supported:
+                if pref in s:
+                    _DISCOVERED_MODEL = s
+                    return s
+        if supported:
+            _DISCOVERED_MODEL = supported[0]
+            return supported[0]
+    except Exception as exc:
+        logger.warning("Failed to auto-discover Gemini models: %s", exc)
+    return ""
+
+
 def query_vision_api(
     payload: Dict[str, Any],
     api_key: str,
@@ -221,81 +280,106 @@ def query_vision_api(
     timeout: float = REQUEST_TIMEOUT_SECONDS,
     retry_delay: float = RETRY_DELAY_SECONDS,
 ) -> Tuple[str, int, float]:
-    """Send the vision/audio request to the Gemini API with 1 retry on network error, 429, or 5xx.
+    """Send the vision/audio request to the Gemini API with model fallback on 404 and 1 retry on network error, 429, or 5xx.
 
     Returns (cleaned_answer_text, payload_size_bytes, api_latency_seconds).
     """
+    global _DISCOVERED_MODEL
     if not api_key or not api_key.strip():
         raise VisionAPIError("Missing GEMINI_API_KEY.")
 
-    endpoint = get_gemini_endpoint(model)
+    primary_model = _DISCOVERED_MODEL or _normalize_gemini_model_name(model)
+    candidate_models = [primary_model] + [m for m in FALLBACK_MODELS if m != primary_model]
+
     body_bytes = json.dumps(payload).encode("utf-8")
     payload_size_bytes = len(body_bytes)
     logger.info(
         "Prepared Gemini API payload: %.1f KB (%d bytes), model=%s",
         payload_size_bytes / 1024.0,
         payload_size_bytes,
-        model,
+        primary_model,
     )
 
+    clean_key = api_key.strip()
     headers = {
-        "x-goog-api-key": api_key.strip(),
+        "x-goog-api-key": clean_key,
         "content-type": "application/json",
     }
 
     last_error: Exception = VisionAPIError("Unknown API failure")
     t_start = time.monotonic()
 
-    for attempt in (1, 2):
-        try:
-            response = requests.post(
-                endpoint,
-                headers=headers,
-                data=body_bytes,
-                timeout=timeout,
-            )
-            status = response.status_code
+    idx = 0
+    while idx < len(candidate_models):
+        current_model = candidate_models[idx]
+        idx += 1
+        endpoint = get_gemini_endpoint(current_model)
+        for attempt in (1, 2):
+            try:
+                response = requests.post(
+                    endpoint,
+                    headers=headers,
+                    params={"key": clean_key},
+                    data=body_bytes,
+                    timeout=timeout,
+                )
+                status = response.status_code
 
-            if status == 200:
-                latency = time.monotonic() - t_start
-                data = response.json()
-                candidates = data.get("candidates") or []
-                if not candidates:
-                    raise VisionAPIError("Gemini API returned no candidates.")
-                parts = candidates[0].get("content", {}).get("parts") or []
-                raw_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
-                cleaned = clean_spoken_text(raw_text)
-                if not cleaned:
-                    raise VisionAPIError("Gemini API returned empty text content.")
-                return cleaned, payload_size_bytes, latency
+                if status == 200:
+                    latency = time.monotonic() - t_start
+                    data = response.json()
+                    candidates = data.get("candidates") or []
+                    if not candidates:
+                        raise VisionAPIError("Gemini API returned no candidates.")
+                    parts = candidates[0].get("content", {}).get("parts") or []
+                    raw_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+                    cleaned = clean_spoken_text(raw_text)
+                    if not cleaned:
+                        raise VisionAPIError("Gemini API returned empty text content.")
+                    _DISCOVERED_MODEL = current_model
+                    return cleaned, payload_size_bytes, latency
 
-            if status == 429 or status >= 500:
-                last_error = VisionAPIError(f"HTTP {status} from Gemini API")
+                if status == 404:
+                    err_detail = (response.text or "")[:160].strip()
+                    logger.warning(
+                        "Gemini model %r returned HTTP 404 (%s); discovering available models...",
+                        current_model,
+                        err_detail,
+                    )
+                    discovered = _discover_available_gemini_model(clean_key)
+                    if discovered and discovered not in candidate_models:
+                        candidate_models.insert(idx, discovered)
+                    last_error = VisionAPIError(f"HTTP 404 model not found ({current_model}): {err_detail}")
+                    break  # Try next candidate model immediately
+
+                if status == 429 or status >= 500:
+                    last_error = VisionAPIError(f"HTTP {status} from Gemini API")
+                    if attempt == 1:
+                        logger.warning(
+                            "Gemini API returned HTTP %d on attempt 1; retrying in %.1fs...",
+                            status,
+                            retry_delay,
+                        )
+                        time.sleep(retry_delay)
+                        continue
+                    raise last_error
+
+                # 4xx client error (other than 404/429) - do not retry
+                err_detail = (response.text or "")[:200].strip()
+                raise VisionAPIError(f"HTTP {status} client error from Gemini API: {err_detail}")
+
+            except requests.RequestException as exc:
+                last_error = VisionAPIError(f"Network error contacting Gemini API: {type(exc).__name__}")
                 if attempt == 1:
                     logger.warning(
-                        "Gemini API returned HTTP %d on attempt 1; retrying in %.1fs...",
-                        status,
+                        "Network error on attempt 1 (%s); retrying in %.1fs...",
+                        type(exc).__name__,
                         retry_delay,
                     )
                     time.sleep(retry_delay)
                     continue
-                raise last_error
-
-            # 4xx client error (other than 429) - do not retry
-            raise VisionAPIError(f"HTTP {status} client error from Gemini API")
-
-        except requests.RequestException as exc:
-            last_error = VisionAPIError(f"Network error contacting Gemini API: {type(exc).__name__}")
-            if attempt == 1:
-                logger.warning(
-                    "Network error on attempt 1 (%s); retrying in %.1fs...",
-                    type(exc).__name__,
-                    retry_delay,
-                )
-                time.sleep(retry_delay)
-                continue
-            raise last_error from exc
-        except (KeyError, IndexError, ValueError, TypeError) as exc:
-            raise VisionAPIError(f"Malformed response from Gemini API: {exc}") from exc
+                raise last_error from exc
+            except (KeyError, IndexError, ValueError, TypeError) as exc:
+                raise VisionAPIError(f"Malformed response from Gemini API: {exc}") from exc
 
     raise last_error

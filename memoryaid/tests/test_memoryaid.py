@@ -196,10 +196,19 @@ class TestVisionPayloadAndCleaning(unittest.TestCase):
         cleaned = clean_spoken_text(raw)
         self.assertEqual(cleaned, "You're at Joe's Cafe. cafe Maria is here.")
 
+    @patch("memoryaid.vision.requests.get")
     @patch("memoryaid.vision.requests.post")
-    def test_query_vision_api_retries_once_on_503_then_succeeds(self, mock_post: MagicMock) -> None:
-        resp_503 = MagicMock()
-        resp_503.status_code = 503
+    def test_query_vision_api_falls_back_on_404_or_claude_model_name(self, mock_post: MagicMock, mock_get: MagicMock) -> None:
+        import memoryaid.vision as vision_mod
+        vision_mod._DISCOVERED_MODEL = ""
+        mock_get_resp = MagicMock()
+        mock_get_resp.status_code = 200
+        mock_get_resp.json.return_value = {"models": [{"name": "models/gemini-2.0-flash", "supportedGenerationMethods": ["generateContent"]}]}
+        mock_get.return_value = mock_get_resp
+
+        resp_404 = MagicMock()
+        resp_404.status_code = 404
+        resp_404.text = "models/gemini-2.5-flash not found"
 
         resp_200 = MagicMock()
         resp_200.status_code = 200
@@ -207,21 +216,21 @@ class TestVisionPayloadAndCleaning(unittest.TestCase):
             "candidates": [
                 {
                     "content": {
-                        "parts": [{"text": "*You're at Joe's Cafe.*"}]
+                        "parts": [{"text": "You're in David's bedroom."}]
                     }
                 }
             ]
         }
 
-        mock_post.side_effect = [resp_503, resp_200]
+        mock_post.side_effect = [resp_404, resp_200]
         payload = build_messages_payload([], "NEW_B64")
 
-        text, size_bytes, _latency = query_vision_api(
-            payload, api_key="test-key", model="gemini-2.5-flash", timeout=5, retry_delay=0.01
+        text, _size_bytes, _latency = query_vision_api(
+            payload, api_key="test-key", model="claude-haiku-5-5", timeout=5, retry_delay=0.01
         )
-        self.assertEqual(text, "You're at Joe's Cafe.")
-        self.assertGreater(size_bytes, 100)
+        self.assertEqual(text, "You're in David's bedroom.")
         self.assertEqual(mock_post.call_count, 2)
+        vision_mod._DISCOVERED_MODEL = ""
 
     @patch("memoryaid.vision.requests.post")
     def test_query_vision_api_fails_after_retry_on_network_error(self, mock_post: MagicMock) -> None:

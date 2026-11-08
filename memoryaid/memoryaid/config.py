@@ -133,6 +133,12 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
     )
     fish_model = merged.get("FISH_MODEL", "").strip()
     model = merged.get("MODEL", "").strip() or "gemini-2.5-flash"
+    if model.lower().startswith("claude"):
+        logger.warning(
+            "Found legacy Anthropic MODEL=%r in env file; overriding with 'gemini-2.5-flash'.",
+            model,
+        )
+        model = "gemini-2.5-flash"
     bluetooth_mac = merged.get("BLUETOOTH_MAC", "").strip().upper()
     audio_device = merged.get("AUDIO_DEVICE", "").strip()
     if not audio_device:
