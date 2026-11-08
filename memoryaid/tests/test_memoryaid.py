@@ -23,7 +23,12 @@ from memoryaid.app import (
 )
 from memoryaid.camera import CameraError, MockCamera
 from memoryaid.config import Config, load_config
-from memoryaid.memories import PlaceMemory, load_memories, save_recorded_memory
+from memoryaid.memories import (
+    PlaceMemory,
+    load_memories,
+    save_recorded_memory,
+    sync_remote_website_memories,
+)
 from memoryaid.speech import normalize_electret_wav_bytes, synthesize_fish_audio_wav
 from memoryaid.vision import (
     SYSTEM_PROMPT,
@@ -144,6 +149,51 @@ class TestMemoriesAndCache(unittest.TestCase):
                 (root / place.name / "note.txt").read_text(encoding="utf-8").strip(),
                 spoken,
             )
+
+    @patch("memoryaid.memories.requests.get")
+    def test_sync_remote_website_memories_downloads_new_and_updates_changed(
+        self, mock_get: MagicMock
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "memories"
+            raw_jpeg = base64.b64decode(_create_dummy_jpeg_b64((640, 480), (180, 120, 60)))
+
+            resp_list = MagicMock()
+            resp_list.status_code = 200
+            resp_list.json.return_value = [
+                {
+                    "id": "f912baba-27d0-4231-8209-23bce84d00e8",
+                    "filename": "pxl-20261108-f912baba.jpg",
+                    "description": "This is the living room, where you watch football and drink beer!",
+                    "uploadedAt": "2026-11-08T01:25:46.366Z",
+                }
+            ]
+
+            resp_img = MagicMock()
+            resp_img.status_code = 200
+            resp_img.content = raw_jpeg
+
+            mock_get.side_effect = [resp_list, resp_img]
+
+            # 1st sync: should download the new photo and return True
+            changed = sync_remote_website_memories(root, website_url="http://localhost:5173")
+            self.assertTrue(changed)
+
+            places = load_memories(root)
+            self.assertEqual(len(places), 1)
+            self.assertTrue(places[0].name.startswith("web_"))
+            self.assertEqual(
+                places[0].note,
+                "This is the living room, where you watch football and drink beer!",
+            )
+            self.assertEqual(len(places[0].images_b64), 1)
+
+            # 2nd sync with identical data: should NOT re-download the image and should return False
+            mock_get.reset_mock()
+            mock_get.side_effect = [resp_list]
+            changed_second = sync_remote_website_memories(root, website_url="http://localhost:5173")
+            self.assertFalse(changed_second)
+            self.assertEqual(mock_get.call_count, 1)
 
 
 class TestVisionPayloadAndCleaning(unittest.TestCase):
@@ -370,14 +420,25 @@ class TestErrorMappingAndAppLoop(unittest.TestCase):
 
     def test_mock_camera_loads_and_resizes_image(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            img_path = Path(tmp) / "test.jpg"
+            tmp_dir = Path(tmp)
+            img_path = tmp_dir / "test.jpg"
+            last_cap = tmp_dir / "last_capture.jpg"
+            cap_dir = tmp_dir / "captured_photos"
             _create_dummy_image(img_path, size=(1280, 960), color=(50, 100, 150))
-            cam = MockCamera(image_path=img_path)
+            cam = MockCamera(
+                image_path=img_path,
+                save_last_capture=True,
+                last_capture_path=last_cap,
+                captures_dir=cap_dir,
+            )
             cam.start()
             b64 = cam.capture_base64()
             raw = base64.b64decode(b64)
             with Image.open(io.BytesIO(raw)) as img:
                 self.assertEqual(img.size, (640, 480))
+            self.assertTrue(last_cap.is_file())
+            self.assertTrue((cap_dir / "latest.jpg").is_file())
+            self.assertEqual(len(list(cap_dir.glob("capture_*.jpg"))), 1)
 
     def test_electret_mic_wav_normalization_removes_dc_and_boosts_gain(self) -> None:
         import array

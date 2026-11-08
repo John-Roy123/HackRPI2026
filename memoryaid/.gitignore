@@ -2,6 +2,7 @@ memoryaid.env
 .cache/
 memories/.cache/
 last_capture.jpg
+captured_photos/
 __pycache__/
 *.py[cod]
 *$py.class

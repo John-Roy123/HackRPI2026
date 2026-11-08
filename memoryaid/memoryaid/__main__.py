@@ -51,6 +51,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="Optional path to a custom .env configuration file.",
     )
+    parser.add_argument(
+        "--website-url",
+        type=str,
+        default=None,
+        help="Override WEBSITE_URL for the external HackRPI2026 Caregiver Website (e.g. http://192.168.1.50:5173).",
+    )
     return parser.parse_args(argv)
 
 
@@ -64,9 +70,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     config = load_config(env_file=args.env_file)
+    if args.website_url is not None:
+        config.website_url = args.website_url.strip().rstrip("/")
     logger.info(
-        "Loaded config: model=%s, audio=%s, record=%s, identify_pin=%d, record_pin=%d, memories_dir=%s, mock=%s",
+        "Loaded config: model=%s, website=%s, audio=%s, record=%s, identify_pin=%d, record_pin=%d, memories_dir=%s, mock=%s",
         config.model,
+        config.website_url,
         config.audio_device,
         config.record_device,
         config.button_pin,
@@ -82,11 +91,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             image_path=args.image,
             save_last_capture=config.save_last_capture,
             last_capture_path=config.last_capture_path,
+            captures_dir=config.captures_dir,
         )
     else:
         camera = PiCamera(
             save_last_capture=config.save_last_capture,
             last_capture_path=config.last_capture_path,
+            captures_dir=config.captures_dir,
         )
 
     speaker = Speaker(

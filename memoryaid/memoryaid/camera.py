@@ -7,18 +7,79 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-from PIL import Image
+from PIL import Image, ImageStat
 
 from .memories import ALLOWED_EXTENSIONS, preprocess_image_bytes
 
 logger = logging.getLogger("memoryaid")
 
 CAPTURE_MAX_EDGE = 640
-CAPTURE_JPEG_QUALITY = 80
+CAPTURE_JPEG_QUALITY = 85
+MAX_SAVED_CAPTURES = 50
 
 
 class CameraError(Exception):
     """Raised when the camera fails to initialise or capture a frame."""
+
+
+def _save_capture_files(
+    jpeg_bytes: bytes,
+    last_capture_path: Optional[Path] = None,
+    captures_dir: Optional[Path] = None,
+    mean_brightness: Optional[float] = None,
+) -> None:
+    """Save the captured JPEG to `last_capture.jpg` and `captured_photos/capture_<timestamp>.jpg` on board."""
+    saved_paths: List[str] = []
+
+    if last_capture_path is not None:
+        try:
+            last_capture_path.parent.mkdir(parents=True, exist_ok=True)
+            last_capture_path.write_bytes(jpeg_bytes)
+            saved_paths.append(str(last_capture_path))
+        except OSError as exc:
+            logger.warning("Could not write capture to %s: %s", last_capture_path, exc)
+
+    if captures_dir is None and last_capture_path is not None:
+        captures_dir = last_capture_path.parent / "captured_photos"
+
+    if captures_dir is not None:
+        try:
+            captures_dir.mkdir(parents=True, exist_ok=True)
+            latest_file = captures_dir / "latest.jpg"
+            latest_file.write_bytes(jpeg_bytes)
+
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            ms = int((time.time() % 1) * 1000)
+            stamped_file = captures_dir / f"capture_{ts}_{ms:03d}.jpg"
+            stamped_file.write_bytes(jpeg_bytes)
+            saved_paths.append(str(stamped_file))
+
+            # Prune old captures beyond MAX_SAVED_CAPTURES so SD card never fills up
+            history = sorted(captures_dir.glob("capture_*.jpg"), key=lambda p: p.name)
+            if len(history) > MAX_SAVED_CAPTURES:
+                for old_file in history[: len(history) - MAX_SAVED_CAPTURES]:
+                    try:
+                        old_file.unlink()
+                    except OSError:
+                        pass
+        except OSError as exc:
+            logger.warning("Could not save timestamped capture in %s: %s", captures_dir, exc)
+
+    if saved_paths:
+        brightness_info = (
+            f", avg_brightness={mean_brightness:.1f}/255" if mean_brightness is not None else ""
+        )
+        logger.info(
+            "Saved onboard camera photo (%d bytes%s) -> %s",
+            len(jpeg_bytes),
+            brightness_info,
+            " and ".join(saved_paths),
+        )
+        if mean_brightness is not None and mean_brightness < 20.0:
+            logger.warning(
+                "Captured camera image is very dark (avg_brightness=%.1f/255)! Check room lighting or camera lens.",
+                mean_brightness,
+            )
 
 
 def encode_pil_image_to_jpeg(
@@ -27,15 +88,24 @@ def encode_pil_image_to_jpeg(
     quality: int = CAPTURE_JPEG_QUALITY,
     save_last_capture: bool = False,
     last_capture_path: Optional[Path] = None,
+    captures_dir: Optional[Path] = None,
 ) -> bytes:
-    """Resize a captured PIL Image and encode as JPEG bytes in memory."""
+    """Resize a captured PIL Image, optionally save on board for inspection, and encode as JPEG bytes."""
+    mean_brightness: Optional[float] = None
+    try:
+        stat = ImageStat.Stat(img.convert("L"))
+        mean_brightness = float(stat.mean[0])
+    except Exception:
+        pass
+
     jpeg_bytes = preprocess_image_bytes(img, max_edge=max_edge, quality=quality)
-    if save_last_capture and last_capture_path is not None:
-        try:
-            last_capture_path.write_bytes(jpeg_bytes)
-            logger.info("Saved debug capture to %s (%d bytes)", last_capture_path, len(jpeg_bytes))
-        except OSError as exc:
-            logger.warning("Could not write debug capture to %s: %s", last_capture_path, exc)
+    if save_last_capture and (last_capture_path is not None or captures_dir is not None):
+        _save_capture_files(
+            jpeg_bytes=jpeg_bytes,
+            last_capture_path=last_capture_path,
+            captures_dir=captures_dir,
+            mean_brightness=mean_brightness,
+        )
     return jpeg_bytes
 
 
@@ -43,14 +113,16 @@ def encode_pil_image_for_capture(
     img: Image.Image,
     save_last_capture: bool = False,
     last_capture_path: Optional[Path] = None,
+    captures_dir: Optional[Path] = None,
 ) -> str:
-    """Resize a captured PIL Image to max 640px long edge, JPEG quality 80, and base64-encode in memory."""
+    """Resize a captured PIL Image to max 640px long edge, JPEG quality 85, and base64-encode in memory."""
     jpeg_bytes = encode_pil_image_to_jpeg(
         img,
         max_edge=CAPTURE_MAX_EDGE,
         quality=CAPTURE_JPEG_QUALITY,
         save_last_capture=save_last_capture,
         last_capture_path=last_capture_path,
+        captures_dir=captures_dir,
     )
     return base64.b64encode(jpeg_bytes).decode("ascii")
 
@@ -60,12 +132,14 @@ class PiCamera:
 
     def __init__(
         self,
-        save_last_capture: bool = False,
+        save_last_capture: bool = True,
         last_capture_path: Optional[Path] = None,
-        warmup_seconds: float = 1.0,
+        captures_dir: Optional[Path] = None,
+        warmup_seconds: float = 1.5,
     ) -> None:
         self._save_last_capture = save_last_capture
         self._last_capture_path = last_capture_path
+        self._captures_dir = captures_dir
         self._warmup_seconds = warmup_seconds
         self._picam2 = None
         self._lock = threading.Lock()
@@ -89,7 +163,7 @@ class PiCamera:
             raise CameraError(f"Failed to initialize PiCamera: {exc}") from exc
 
     def capture_base64(self) -> str:
-        """Capture a single still image, resize to 640px max edge, JPEG quality 80, and return base64."""
+        """Capture a single still image, save on board if enabled, resize to 640px max edge, and return base64."""
         if self._picam2 is None:
             raise CameraError("PiCamera is not started.")
         with self._lock:
@@ -102,6 +176,7 @@ class PiCamera:
             pil_image,
             save_last_capture=self._save_last_capture,
             last_capture_path=self._last_capture_path,
+            captures_dir=self._captures_dir,
         )
 
     def close(self) -> None:
@@ -123,10 +198,12 @@ class MockCamera:
         image_path: Path,
         save_last_capture: bool = False,
         last_capture_path: Optional[Path] = None,
+        captures_dir: Optional[Path] = None,
     ) -> None:
         self._image_path = image_path
         self._save_last_capture = save_last_capture
         self._last_capture_path = last_capture_path
+        self._captures_dir = captures_dir
         self._files: List[Path] = []
         self._index = 0
         self._lock = threading.Lock()
@@ -174,6 +251,7 @@ class MockCamera:
                     img,
                     save_last_capture=self._save_last_capture,
                     last_capture_path=self._last_capture_path,
+                    captures_dir=self._captures_dir,
                 )
         except Exception as exc:
             raise CameraError(f"MockCamera failed to read {chosen}: {exc}") from exc

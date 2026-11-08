@@ -7,7 +7,13 @@ from typing import List, Optional, Protocol
 
 from .camera import CameraError
 from .config import Config
-from .memories import PlaceMemory, build_contact_sheet_b64, load_memories, save_recorded_memory
+from .memories import (
+    PlaceMemory,
+    build_contact_sheet_b64,
+    load_memories,
+    save_recorded_memory,
+    sync_remote_website_memories,
+)
 from .speech import AudioRecordError, AudioRecorder, Speaker
 from .vision import (
     VisionAPIError,
@@ -73,11 +79,18 @@ class MemoryAidApp:
         self._recording_active = False
         self._recorded_photo_b64: Optional[str] = None
         self.contact_sheet_b64: Optional[str] = build_contact_sheet_b64(
-            self.places, cache_dir=self.config.memories_dir / ".cache"
+            self.places,
+            cache_dir=self.config.memories_dir / ".cache",
+            captures_dir=self.config.captures_dir,
         )
 
     def start(self) -> None:
-        """Initialise hardware, connect Bluetooth speaker, and play the startup greeting."""
+        """Initialise hardware, sync caregiver website memories, connect Bluetooth speaker, and play startup greeting."""
+        try:
+            self.sync_website_memories()
+        except Exception as exc:
+            logger.warning("Initial website memory sync skipped: %s", exc)
+
         try:
             self.speaker.connect_bluetooth()
         except Exception as exc:
@@ -120,6 +133,32 @@ class MemoryAidApp:
         finally:
             self._busy_lock.release()
 
+    def sync_website_memories(self) -> bool:
+        """Check the external HackRPI2026 Caregiver Website for any new/updated photos and descriptions.
+
+        If new or updated memories are found, downloads them into `memories/` and rebuilds the Contact Sheet.
+        """
+        t0 = time.monotonic()
+        changed = sync_remote_website_memories(
+            memories_dir=self.config.memories_dir,
+            website_url=self.config.website_url,
+        )
+        if changed:
+            self.places = load_memories(self.config.memories_dir)
+            self.contact_sheet_b64 = build_contact_sheet_b64(
+                self.places,
+                cache_dir=self.config.memories_dir / ".cache",
+                captures_dir=self.config.captures_dir,
+            )
+            logger.info(
+                "Step [website-sync]: loaded new/updated website memories in %.2fs (%d total places active).",
+                time.monotonic() - t0,
+                len(self.places),
+            )
+        else:
+            logger.info("Step [website-sync]: up to date (checked in %.2fs).", time.monotonic() - t0)
+        return changed
+
     def _process_identify_press(self) -> None:
         t_press = time.monotonic()
         logger.info("Identify ('Where am I?') button pressed.")
@@ -129,8 +168,14 @@ class MemoryAidApp:
             self.speaker.speak(MSG_NOT_SET_UP)
             return
 
-        # Speak "Let me take a look." asynchronously while capturing and calling API
+        # Speak "Let me take a look." asynchronously while syncing website, capturing, and calling API
         self.speaker.speak_async(MSG_LET_ME_LOOK)
+
+        # Step 0: Check the external caregiver website for any new/updated photos and load them onto the device
+        try:
+            self.sync_website_memories()
+        except Exception as exc:
+            logger.warning("Website memory sync check failed (continuing with existing memories): %s", exc)
 
         # Step 1: Capture and encode photo
         t_cap_start = time.monotonic()
@@ -146,6 +191,14 @@ class MemoryAidApp:
         logger.info("Step [capture]: completed in %.2fs", capture_sec)
 
         # Step 2: Build payload and send to Gemini REST API
+        places_summary = ", ".join(
+            f"#{i} {p.name} ({len(p.images_b64)} photo(s))" for i, p in enumerate(self.places, start=1)
+        )
+        logger.info(
+            "Comparing onboard camera capture against %d known place(s): [%s]",
+            len(self.places),
+            places_summary or "none",
+        )
         t_prep_start = time.monotonic()
         payload = build_messages_payload(
             places=self.places,
@@ -285,12 +338,18 @@ class MemoryAidApp:
         # Reload places and rebuild the composite contact sheet so the new place is immediately active
         self.places = load_memories(self.config.memories_dir)
         self.contact_sheet_b64 = build_contact_sheet_b64(
-            self.places, cache_dir=self.config.memories_dir / ".cache"
+            self.places,
+            cache_dir=self.config.memories_dir / ".cache",
+            captures_dir=self.config.captures_dir,
         )
         return saved_place
 
     def run_dry_run(self) -> int:
-        """Capture one image, build the full request payload, print the summary, and return payload size."""
+        """Sync website memories, capture one image, build the full request payload, print the summary, and return payload size."""
+        try:
+            self.sync_website_memories()
+        except Exception as exc:
+            logger.warning("Dry-run website sync skipped: %s", exc)
         self.camera.start()
         captured_b64 = self.camera.capture_base64()
         payload = build_messages_payload(
