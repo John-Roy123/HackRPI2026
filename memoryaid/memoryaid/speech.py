@@ -1,5 +1,7 @@
-"""Fish Audio Text-to-Speech (`https://api.fish.audio/v1/tts`, with local fallback) and ALSA microphone recording (`arecord`)."""
+"""Fish Audio Text-to-Speech (`https://api.fish.audio/v1/tts`) and electret microphone recording (`arecord`)."""
 
+import array
+import io
 import logging
 import os
 import re
@@ -8,8 +10,9 @@ import subprocess
 import tempfile
 import threading
 import time
+import wave
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -17,6 +20,7 @@ logger = logging.getLogger("memoryaid")
 
 MAX_RECORD_SECONDS = 60
 MAC_REGEX = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
+ARECORD_CARD_REGEX = re.compile(r"^card\s+(\d+):\s*([^\[]+)\[([^\]]+)\],\s*device\s+(\d+):", re.MULTILINE)
 FISH_TTS_ENDPOINT = "https://api.fish.audio/v1/tts"
 FISH_SAMPLE_RATE = 24000
 FISH_TIMEOUT_SECONDS = 20
@@ -36,6 +40,139 @@ def _speech_env() -> dict:
     if "DBUS_SESSION_BUS_ADDRESS" not in env and os.path.exists(f"{runtime_dir}/bus"):
         env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={runtime_dir}/bus"
     return env
+
+
+def detect_and_configure_electret_mic() -> Optional[str]:
+    """Auto-detect an electret microphone capture card via `arecord -l`, enable ALSA Mic + Auto Gain / Boost, and return its `plughw:X,Y` string."""
+    if shutil.which("arecord") is None:
+        return None
+
+    try:
+        res = subprocess.run(
+            ["arecord", "-l"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        output = res.stdout or ""
+    except Exception as exc:
+        logger.debug("arecord -l failed: %s", exc)
+        return None
+
+    matches = ARECORD_CARD_REGEX.findall(output)
+    if not matches:
+        return None
+
+    # Prefer USB / I2S / ADC / Seeed / WM8960 capture cards if multiple exist
+    chosen: Tuple[str, str, str, str] = matches[0]
+    for m in matches:
+        card_id, short_name, long_name, dev_id = m
+        combined = f"{short_name} {long_name}".lower()
+        if any(k in combined for k in ("usb", "mic", "i2s", "seeed", "wm8960", "adc", "audio")):
+            chosen = m
+            break
+
+    card_num, short_name, long_name, dev_num = chosen
+    plughw = f"plughw:{card_num},{dev_num}"
+    logger.info(
+        "Detected electret microphone capture device: %s (%s - %s)",
+        plughw,
+        short_name.strip(),
+        long_name.strip(),
+    )
+
+    # Enable ALSA mixer capture volume & +20dB electret mic boost on that card
+    if shutil.which("amixer") is not None:
+        for ctrl in ("Mic", "Capture", "ADC", "PGA", "Input", "Boost"):
+            subprocess.run(
+                ["amixer", "-c", card_num, "sset", ctrl, "95%", "unmute", "cap"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            subprocess.run(
+                ["amixer", "-c", card_num, "sset", ctrl, "95%", "unmute"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        for boost_ctrl in ("Mic Boost", "Auto Gain Control", "AGC", "ADC Mic Boost"):
+            subprocess.run(
+                ["amixer", "-c", card_num, "sset", boost_ctrl, "on"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            subprocess.run(
+                ["amixer", "-c", card_num, "sset", boost_ctrl, "100%"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+
+    return plughw
+
+
+def normalize_electret_wav_bytes(wav_bytes: bytes) -> bytes:
+    """Remove DC offset (common with electret mic capsules + bias resistors/ADCs) and normalize quiet speech."""
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            nchannels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            nframes = wf.getnframes()
+            raw_frames = wf.readframes(nframes)
+
+        # Only process 16-bit signed PCM
+        if sampwidth != 2 or len(raw_frames) < 4:
+            return wav_bytes
+
+        samples = array.array("h")
+        samples.frombytes(raw_frames)
+        if not samples:
+            return wav_bytes
+
+        # 1. Subtract DC offset (average sample value)
+        dc_offset = int(sum(samples) // len(samples))
+        if dc_offset != 0:
+            for i in range(len(samples)):
+                val = samples[i] - dc_offset
+                if val > 32767:
+                    val = 32767
+                elif val < -32768:
+                    val = -32768
+                samples[i] = val
+
+        # 2. Peak-normalize if the electret signal is quiet (up to 12x software gain)
+        peak = max(abs(s) for s in samples) or 1
+        target_peak = 24000  # ~73% of full scale
+        if 150 < peak < target_peak:
+            gain = min(12.0, float(target_peak) / float(peak))
+            if gain > 1.25:
+                for i in range(len(samples)):
+                    val = int(samples[i] * gain)
+                    if val > 32767:
+                        val = 32767
+                    elif val < -32768:
+                        val = -32768
+                    samples[i] = val
+                logger.info(
+                    "Applied %.1fx software gain + DC offset removal to electret mic recording (peak=%d).",
+                    gain,
+                    peak,
+                )
+
+        out_buf = io.BytesIO()
+        with wave.open(out_buf, "wb") as out_wf:
+            out_wf.setnchannels(nchannels)
+            out_wf.setsampwidth(sampwidth)
+            out_wf.setframerate(framerate)
+            out_wf.writeframes(samples.tobytes())
+        return out_buf.getvalue()
+    except Exception as exc:
+        logger.debug("Electret audio normalization skipped: %s", exc)
+        return wav_bytes
 
 
 def synthesize_fish_audio_wav(
@@ -143,11 +280,11 @@ def ensure_bluetooth_connected(bluetooth_mac: str = "") -> Optional[str]:
 
 
 class AudioRecorder:
-    """Records 16 kHz mono WAV audio via `arecord` while the record button is held."""
+    """Records 16 kHz mono WAV audio from the electret microphone while the record button is held."""
 
     def __init__(
         self,
-        record_device: str = "default",
+        record_device: str = "auto",
         bluetooth_mac: str = "",
         mock: bool = False,
     ) -> None:
@@ -158,15 +295,29 @@ class AudioRecorder:
         self._proc: Optional[subprocess.Popen] = None
         self._temp_path: Optional[Path] = None
         self._has_arecord = shutil.which("arecord") is not None
+        self._resolved_device: Optional[str] = None
+
+    def _resolve_capture_device(self) -> str:
+        """Resolve the ALSA capture device for the electret microphone (re-detecting if plugged in later)."""
+        if self.record_device and self.record_device not in ("auto", "default"):
+            return self.record_device
+        if self._resolved_device:
+            return self._resolved_device
+        detected = detect_and_configure_electret_mic()
+        if detected:
+            self._resolved_device = detected
+            return detected
+        return "default"
 
     def start_recording(self) -> None:
-        """Start background `arecord` capture to a temporary WAV file."""
+        """Start background `arecord` capture from the electret microphone to a temporary WAV file."""
         with self._lock:
             self._cleanup_unlocked()
             if self.mock or not self._has_arecord:
                 logger.info("AudioRecorder (mock): started listening.")
                 return
 
+            device = self._resolve_capture_device()
             fd, tmp_name = tempfile.mkstemp(prefix="memoryaid_rec_", suffix=".wav")
             os.close(fd)
             self._temp_path = Path(tmp_name)
@@ -175,7 +326,7 @@ class AudioRecorder:
                 "arecord",
                 "-q",
                 "-D",
-                self.record_device,
+                device,
                 "-f",
                 "S16_LE",
                 "-r",
@@ -197,8 +348,8 @@ class AudioRecorder:
                     env=_speech_env(),
                 )
                 logger.info(
-                    "Started recording audio from ALSA device %r to %s",
-                    self.record_device,
+                    "Started recording electret microphone from ALSA device %r to %s",
+                    device,
                     self._temp_path,
                 )
             except Exception as exc:
@@ -206,7 +357,7 @@ class AudioRecorder:
                 raise AudioRecordError(f"Failed to start arecord: {exc}") from exc
 
     def stop_recording(self) -> bytes:
-        """Stop `arecord`, read the recorded WAV bytes, and delete the temporary file."""
+        """Stop `arecord`, normalize the electret microphone WAV bytes, and delete the temporary file."""
         with self._lock:
             if self.mock or not self._has_arecord:
                 logger.info("AudioRecorder (mock): stopped listening.")
@@ -234,16 +385,24 @@ class AudioRecorder:
                     proc.stderr.close()
 
                 if not temp_path.is_file():
+                    # Reset cached device so next press re-probes `arecord -l` in case mic was just connected
+                    self._resolved_device = None
                     err_msg = stderr_bytes.decode("utf-8", errors="replace").strip()
-                    raise AudioRecordError(f"arecord produced no file ({err_msg})")
+                    raise AudioRecordError(f"Electret microphone not detected or produced no file ({err_msg})")
 
                 wav_bytes = temp_path.read_bytes()
                 if len(wav_bytes) <= 44:
+                    self._resolved_device = None
                     err_msg = stderr_bytes.decode("utf-8", errors="replace").strip()
                     raise AudioRecordError(f"Recorded audio is empty ({len(wav_bytes)} bytes). {err_msg}")
 
-                logger.info("Recorded %d bytes (%.1f KB) of WAV audio.", len(wav_bytes), len(wav_bytes) / 1024.0)
-                return wav_bytes
+                normalized_wav = normalize_electret_wav_bytes(wav_bytes)
+                logger.info(
+                    "Recorded %d bytes (%.1f KB) of electret mic WAV audio.",
+                    len(normalized_wav),
+                    len(normalized_wav) / 1024.0,
+                )
+                return normalized_wav
             finally:
                 try:
                     if temp_path.exists():

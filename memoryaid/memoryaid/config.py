@@ -61,12 +61,11 @@ class Config:
     model: str = "gemini-2.5-flash"
     bluetooth_mac: str = ""
     audio_device: str = "default"
-    record_device: str = "default"
+    record_device: str = "auto"
     voice: str = "en-us"
     speech_rate: int = 140
     button_pin: int = 17
     record_button_pin: int = 27
-    stream_port: int = 8080
     memories_dir: Path = Path("memories")
     save_last_capture: bool = False
     last_capture_path: Path = Path("last_capture.jpg")
@@ -117,7 +116,6 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
         "SPEECH_RATE",
         "BUTTON_PIN",
         "RECORD_BUTTON_PIN",
-        "STREAM_PORT",
         "MEMORIES_DIR",
         "SAVE_LAST_CAPTURE",
     ):
@@ -145,12 +143,11 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
     elif audio_device == "bluealsa" and bluetooth_mac:
         audio_device = f"bluealsa:DEV={bluetooth_mac},PROFILE=a2dp"
 
-    record_device = merged.get("RECORD_DEVICE", "").strip() or "default"
+    record_device = merged.get("RECORD_DEVICE", "").strip() or "auto"
     voice = merged.get("VOICE", "").strip() or "en-us"
     speech_rate = _parse_int(merged.get("SPEECH_RATE", "140"), 140, "SPEECH_RATE")
     button_pin = _parse_int(merged.get("BUTTON_PIN", "17"), 17, "BUTTON_PIN")
     record_button_pin = _parse_int(merged.get("RECORD_BUTTON_PIN", "27"), 27, "RECORD_BUTTON_PIN")
-    stream_port = _parse_int(merged.get("STREAM_PORT", "8080"), 8080, "STREAM_PORT")
 
     raw_memories_dir = merged.get("MEMORIES_DIR", "").strip()
     if raw_memories_dir:
@@ -176,7 +173,6 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
         speech_rate=speech_rate,
         button_pin=button_pin,
         record_button_pin=record_button_pin,
-        stream_port=stream_port,
         memories_dir=memories_dir,
         save_last_capture=save_last_capture,
         last_capture_path=last_capture_path,

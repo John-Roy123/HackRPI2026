@@ -15,8 +15,6 @@ logger = logging.getLogger("memoryaid")
 
 CAPTURE_MAX_EDGE = 640
 CAPTURE_JPEG_QUALITY = 80
-STREAM_MAX_EDGE = 480
-STREAM_JPEG_QUALITY = 70
 
 
 class CameraError(Exception):
@@ -58,57 +56,40 @@ def encode_pil_image_for_capture(
 
 
 class PiCamera:
-    """Hardware camera using picamera2 on Raspberry Pi OS (thread-safe for live streaming + capture)."""
+    """Hardware camera using picamera2 on Raspberry Pi OS."""
 
     def __init__(
         self,
         save_last_capture: bool = False,
         last_capture_path: Optional[Path] = None,
         warmup_seconds: float = 1.0,
-        enable_preview_window: bool = True,
     ) -> None:
         self._save_last_capture = save_last_capture
         self._last_capture_path = last_capture_path
         self._warmup_seconds = warmup_seconds
-        self._enable_preview_window = enable_preview_window
         self._picam2 = None
         self._lock = threading.Lock()
 
     def start(self) -> None:
-        """Lazily import picamera2, configure 640x480 video/still capture, and open preview if DISPLAY is present."""
-        import os
-
+        """Lazily import picamera2, configure 1280x960 still capture, and wait for auto-exposure."""
         try:
             logger.info("Importing picamera2 (this takes 20-30s on Raspberry Pi Zero W)...")
-            from picamera2 import Picamera2, Preview  # type: ignore[import-not-found]
+            from picamera2 import Picamera2  # type: ignore[import-not-found]
 
             self._picam2 = Picamera2()
-            # Use 640x480 configuration so live streaming and still capture are fast on Pi Zero W
-            config = self._picam2.create_video_configuration(
-                main={"size": (640, 480)}
+            still_config = self._picam2.create_still_configuration(
+                main={"size": (1280, 960)}
             )
-            self._picam2.configure(config)
-
-            if self._enable_preview_window and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-                try:
-                    self._picam2.start_preview(Preview.QTGL)
-                    logger.info("Opened native picamera2 preview window on display.")
-                except Exception:
-                    try:
-                        self._picam2.start_preview(Preview.QT)
-                        logger.info("Opened QT picamera2 preview window on display.")
-                    except Exception as exc:
-                        logger.debug("Could not open native picamera2 preview window: %s", exc)
-
+            self._picam2.configure(still_config)
             self._picam2.start()
             if self._warmup_seconds > 0:
                 time.sleep(self._warmup_seconds)
-            logger.info("Camera initialised (640x480 live + still configuration).")
+            logger.info("Camera initialised (1280x960 still configuration).")
         except Exception as exc:
             raise CameraError(f"Failed to initialize PiCamera: {exc}") from exc
 
-    def capture_jpeg_bytes(self, for_stream: bool = False) -> bytes:
-        """Capture a single frame and return raw JPEG bytes (thread-safe)."""
+    def capture_base64(self) -> str:
+        """Capture a single still image, resize to 640px max edge, JPEG quality 80, and return base64."""
         if self._picam2 is None:
             raise CameraError("PiCamera is not started.")
         with self._lock:
@@ -117,25 +98,11 @@ class PiCamera:
             except Exception as exc:
                 raise CameraError(f"Failed to capture image from PiCamera: {exc}") from exc
 
-        if for_stream:
-            return encode_pil_image_to_jpeg(
-                pil_image,
-                max_edge=STREAM_MAX_EDGE,
-                quality=STREAM_JPEG_QUALITY,
-                save_last_capture=False,
-            )
-        return encode_pil_image_to_jpeg(
+        return encode_pil_image_for_capture(
             pil_image,
-            max_edge=CAPTURE_MAX_EDGE,
-            quality=CAPTURE_JPEG_QUALITY,
             save_last_capture=self._save_last_capture,
             last_capture_path=self._last_capture_path,
         )
-
-    def capture_base64(self) -> str:
-        """Capture a single still image, resize to 640px max edge, JPEG quality 80, and return base64."""
-        jpeg_bytes = self.capture_jpeg_bytes(for_stream=False)
-        return base64.b64encode(jpeg_bytes).decode("ascii")
 
     def close(self) -> None:
         with self._lock:
@@ -163,7 +130,6 @@ class MockCamera:
         self._files: List[Path] = []
         self._index = 0
         self._lock = threading.Lock()
-        self._cached_stream_jpeg: Optional[bytes] = None
 
     def start(self) -> None:
         if not self._image_path.exists():
@@ -193,37 +159,24 @@ class MockCamera:
             self._files = [self._image_path]
             logger.info("MockCamera ready with image %s.", self._image_path)
 
-    def capture_jpeg_bytes(self, for_stream: bool = False) -> bytes:
+    def capture_base64(self) -> str:
         if not self._files:
             raise CameraError("MockCamera has no images loaded.")
 
         with self._lock:
-            if for_stream and len(self._files) == 1 and self._cached_stream_jpeg is not None:
-                return self._cached_stream_jpeg
-
             chosen = self._files[self._index % len(self._files)]
-            if not for_stream:
-                self._index += 1
-                logger.info("MockCamera capturing from %s", chosen)
+            self._index += 1
+            logger.info("MockCamera capturing from %s", chosen)
 
         try:
             with Image.open(chosen) as img:
-                jpeg_bytes = encode_pil_image_to_jpeg(
+                return encode_pil_image_for_capture(
                     img,
-                    max_edge=STREAM_MAX_EDGE if for_stream else CAPTURE_MAX_EDGE,
-                    quality=STREAM_JPEG_QUALITY if for_stream else CAPTURE_JPEG_QUALITY,
-                    save_last_capture=False if for_stream else self._save_last_capture,
+                    save_last_capture=self._save_last_capture,
                     last_capture_path=self._last_capture_path,
                 )
-                if for_stream and len(self._files) == 1:
-                    self._cached_stream_jpeg = jpeg_bytes
-                return jpeg_bytes
         except Exception as exc:
             raise CameraError(f"MockCamera failed to read {chosen}: {exc}") from exc
-
-    def capture_base64(self) -> str:
-        jpeg_bytes = self.capture_jpeg_bytes(for_stream=False)
-        return base64.b64encode(jpeg_bytes).decode("ascii")
 
     def close(self) -> None:
         pass

@@ -51,16 +51,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="Optional path to a custom .env configuration file.",
     )
-    parser.add_argument(
-        "--no-stream",
-        action="store_true",
-        help="Disable the live camera HTTP stream on localhost:8080.",
-    )
-    parser.add_argument(
-        "--no-popup",
-        action="store_true",
-        help="Do not automatically pop up a browser window for the live stream.",
-    )
     return parser.parse_args(argv)
 
 
@@ -139,8 +129,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         speaker=speaker,
         recorder=recorder,
         button=None,
-        enable_stream=not args.no_stream,
-        auto_popup_stream=not args.no_popup,
     )
 
     if args.mock:

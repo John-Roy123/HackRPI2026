@@ -24,8 +24,7 @@ from memoryaid.app import (
 from memoryaid.camera import CameraError, MockCamera
 from memoryaid.config import Config, load_config
 from memoryaid.memories import PlaceMemory, load_memories, save_recorded_memory
-from memoryaid.speech import synthesize_fish_audio_wav
-from memoryaid.stream import CameraStreamServer
+from memoryaid.speech import normalize_electret_wav_bytes, synthesize_fish_audio_wav
 from memoryaid.vision import (
     SYSTEM_PROMPT,
     VisionAPIError,
@@ -361,19 +360,27 @@ class TestErrorMappingAndAppLoop(unittest.TestCase):
             with Image.open(io.BytesIO(raw)) as img:
                 self.assertEqual(img.size, (640, 480))
 
-    def test_camera_stream_server_retrieves_frame(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            img_path = Path(tmp) / "test.jpg"
-            _create_dummy_image(img_path, size=(640, 480), color=(20, 80, 140))
-            cam = MockCamera(image_path=img_path)
-            cam.start()
+    def test_electret_mic_wav_normalization_removes_dc_and_boosts_gain(self) -> None:
+        import array
+        import wave
 
-            server = CameraStreamServer(camera=cam, port=8080, fps=2.0)
-            frame = server.get_frame()
-            self.assertIsNotNone(frame)
-            assert frame is not None
-            self.assertTrue(frame.startswith(b"\xff\xd8"))
-            self.assertGreater(len(frame), 100)
+        # Create a 16-bit mono WAV with a +1000 DC offset and quiet speech signal (+/- 500)
+        samples = array.array("h", [1000 + (500 if i % 2 == 0 else -500) for i in range(400)])
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(samples.tobytes())
+
+        normalized = normalize_electret_wav_bytes(buf.getvalue())
+        with wave.open(io.BytesIO(normalized), "rb") as out_wf:
+            out_samples = array.array("h")
+            out_samples.frombytes(out_wf.readframes(out_wf.getnframes()))
+
+        # DC offset should be ~0 and peak should be boosted significantly above 500
+        self.assertAlmostEqual(sum(out_samples) / len(out_samples), 0.0, delta=5.0)
+        self.assertGreater(max(abs(s) for s in out_samples), 4000)
 
 
 if __name__ == "__main__":
