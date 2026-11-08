@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Photo Uploads</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Newsreader:opsz,wght@6..72,500&display=swap"
+    />
+  </head>
+  <body>
+    <main class="page">
+      <header class="intro">
+        <h1>Upload Photos</h1>
+        <p>Add your photos and give each one a description.</p>
+      </header>
+
+      <section class="card" aria-label="Upload photos">
+        <label class="dropzone" id="dropzone" for="file-input">
+          <input class="visually-hidden" id="file-input" type="file" multiple
+            accept="image/jpeg,image/png,image/gif,image/webp,image/avif,image/bmp" />
+          <span class="dropzone-icon" data-icon="upload"></span>
+          <span class="dropzone-title">Drop your photos here or <span class="link">browse</span></span>
+          <span class="dropzone-hint">JPEG, PNG, GIF, WebP, AVIF or BMP · up to 25 MB each</span>
+        </label>
+
+        <div id="queue-section" hidden>
+          <h2 class="section-label">Ready to upload</h2>
+          <ul class="file-list" id="queue-list"></ul>
+        </div>
+      </section>
+
+      <div class="actions">
+        <button class="btn btn-secondary" id="clear-btn" type="button" disabled>Clear</button>
+        <button class="btn btn-primary" id="upload-btn" type="button" disabled>Upload</button>
+      </div>
+
+      <section class="gallery" aria-labelledby="gallery-title">
+        <div class="gallery-head">
+          <div>
+            <h2 id="gallery-title">Your Photos</h2>
+            <p>Scroll through your photos and edit their descriptions. Changes save automatically.</p>
+          </div>
+          <div class="gallery-nav" id="gallery-nav" hidden>
+            <button class="nav-btn" id="prev-btn" type="button" aria-label="Previous photo" data-icon="chevron-left"></button>
+            <span class="counter" id="counter" aria-live="polite"></span>
+            <button class="nav-btn" id="next-btn" type="button" aria-label="Next photo" data-icon="chevron-right"></button>
+          </div>
+        </div>
+
+        <p class="empty" id="gallery-empty">Loading photos…</p>
+        <div id="gallery-body" hidden>
+          <div class="carousel" id="carousel" tabindex="0" aria-roledescription="carousel" aria-label="Uploaded photos"></div>
+          <div class="thumbs" id="thumbs" aria-label="Jump to photo"></div>
+        </div>
+      </section>
+    </main>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
