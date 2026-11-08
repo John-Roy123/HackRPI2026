@@ -35,8 +35,6 @@ body {
   font: 16px/1.5 var(--sans);
   color: var(--ink);
   background-color: var(--cloud);
-  /* The faint vertical column lines from the upload mockup */
-  background-image: linear-gradient(to right, var(--grid-line) 1px, transparent 1px);
   background-size: 134px 100%;
   background-position: center top;
   background-attachment: fixed;
