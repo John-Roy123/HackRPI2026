@@ -1,4 +1,5 @@
 memoryaid.env
+.server_url
 .cache/
 memories/.cache/
 last_capture.jpg

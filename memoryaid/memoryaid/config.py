@@ -103,6 +103,15 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
     if local_env.is_file():
         merged.update(_parse_env_file(local_env))
 
+    server_url_file = project_root / ".server_url"
+    if server_url_file.is_file():
+        try:
+            saved_url = server_url_file.read_text(encoding="utf-8").strip()
+            if saved_url:
+                merged["WEBSITE_URL"] = saved_url
+        except OSError:
+            pass
+
     for key in (
         "GEMINI_API_KEY",
         "FISH_API_KEY",
@@ -143,7 +152,9 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
         )
         model = "gemini-3-flash-preview"
 
-    website_url = merged.get("WEBSITE_URL", "http://localhost:5173").strip().rstrip("/")
+    website_url = merged.get("WEBSITE_URL", "http://192.168.50.209:5173").strip().rstrip("/")
+    if not website_url:
+        website_url = "http://192.168.50.209:5173"
     bluetooth_mac = merged.get("BLUETOOTH_MAC", "").strip().upper()
     audio_device = merged.get("AUDIO_DEVICE", "").strip()
     if not audio_device:
@@ -168,7 +179,9 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
     else:
         memories_dir = (project_root / "memories").resolve()
 
-    save_last_capture = _parse_bool(merged.get("SAVE_LAST_CAPTURE", "true"))
+    # Always save onboard camera captures to HackRPI2026/memoryaid/last_capture.jpg and captured_photos/
+    # (even if an older /etc/memoryaid.env had SAVE_LAST_CAPTURE=false).
+    save_last_capture = True
     last_capture_path = (project_root / "last_capture.jpg").resolve()
     captures_dir = (project_root / "captured_photos").resolve()
 

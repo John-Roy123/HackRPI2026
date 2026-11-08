@@ -1,8 +1,10 @@
 """Main runtime orchestration for Memory Aid (Identify button + Hold-to-Record button)."""
 
+import base64
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import List, Optional, Protocol
 
 from .camera import CameraError
@@ -19,6 +21,7 @@ from .vision import (
     VisionAPIError,
     build_messages_payload,
     query_vision_api,
+    resolve_exact_place_description,
     summarize_payload,
     transcribe_audio_with_gemini,
 )
@@ -143,7 +146,7 @@ class MemoryAidApp:
             memories_dir=self.config.memories_dir,
             website_url=self.config.website_url,
         )
-        if changed:
+        if changed or not self.places:
             self.places = load_memories(self.config.memories_dir)
             self.contact_sheet_b64 = build_contact_sheet_b64(
                 self.places,
@@ -181,6 +184,7 @@ class MemoryAidApp:
         t_cap_start = time.monotonic()
         try:
             captured_b64 = self.camera.capture_base64()
+            self._persist_capture_locally(captured_b64)
         except Exception as exc:
             capture_err = exc if isinstance(exc, CameraError) else CameraError(str(exc))
             logger.error("Camera capture error: %s", capture_err)
@@ -221,20 +225,22 @@ class MemoryAidApp:
             self.speaker.speak(map_error_to_spoken_message(vision_err))
             return
 
+        spoken_text = resolve_exact_place_description(answer_text, self.places)
         logger.info(
-            "Step [upload+api]: payload=%d bytes (%.1f KB), prep=%.2fs, api_latency=%.2fs",
+            "Step [upload+api]: payload=%d bytes (%.1f KB), prep=%.2fs, api_latency=%.2fs, spoken=%r",
             payload_bytes,
             payload_bytes / 1024.0,
             prep_sec,
             api_sec,
+            spoken_text,
         )
 
-        # Step 3: Wait for "Let me take a look." to finish, then speak the answer
+        # Step 3: Wait for "Let me take a look." to finish, then speak the exact stored description
         self.speaker.wait()
         time_to_first_word = time.monotonic() - t_press
         logger.info("Press-to-first-word latency: %.2fs", time_to_first_word)
 
-        speech_sec = self.speaker.speak(answer_text)
+        speech_sec = self.speaker.speak(spoken_text)
         total_sec = time.monotonic() - t_press
         logger.info(
             "Step [speech]: spoke answer in %.2fs (total cycle=%.2fs)",
@@ -265,6 +271,7 @@ class MemoryAidApp:
             self._recording_active = True
             # Take a picture of the room while listening
             self._recorded_photo_b64 = self.camera.capture_base64()
+            self._persist_capture_locally(self._recorded_photo_b64)
             logger.info("Captured room photo during record hold; listening until button release...")
         except Exception as exc:
             logger.error("Failed to start memory recording: %s", exc)
@@ -328,6 +335,37 @@ class MemoryAidApp:
             self.speaker.speak(map_error_to_spoken_message(exc))
         finally:
             self._busy_lock.release()
+
+    def _persist_capture_locally(self, captured_b64: str) -> None:
+        """Unconditionally save every captured camera frame to disk inside HackRPI2026/memoryaid/."""
+        if not captured_b64 or not self.config.has_api_key:
+            return
+        try:
+            raw_bytes = base64.b64decode(captured_b64, validate=True)
+            if len(raw_bytes) < 32:
+                return
+        except Exception:
+            return
+
+        project_root = self.config.memories_dir.resolve().parent
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        targets = [
+            project_root / "last_capture.jpg",
+            project_root / "captured_photos" / "latest.jpg",
+            project_root / "captured_photos" / f"capture_{ts}.jpg",
+            project_root / "images" / "last_capture.jpg",
+            project_root / "images" / f"capture_{ts}.jpg",
+        ]
+        saved: List[str] = []
+        for target in targets:
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(raw_bytes)
+                saved.append(str(target))
+            except OSError:
+                pass
+        if saved:
+            logger.info("Saved camera photo locally -> %s", saved[0])
 
     def _save_memory_and_reload(self, photo_b64: str, note_text: str) -> PlaceMemory:
         saved_place = save_recorded_memory(

@@ -31,22 +31,22 @@ RETRY_DELAY_SECONDS = 2.0
 _DISCOVERED_MODEL: str = ""
 _FAILED_404_MODELS: set = set()
 
-SYSTEM_PROMPT = """You are a gentle memory companion carried by a person living with dementia.
-You will be given a set of known places from their memory book (each with reference photos and a caregiver's note/description), followed by a NEW photo taken by their onboard Raspberry Pi camera right now.
+MSG_UNRECOGNIZED_PLACE = "I don't recognize this place from your memory book yet."
 
-Your ONLY task is to compare the NEW photo against the provided reference photos and caregiver notes, and from EXCLUSIVELY that provided information determine which known place the user is in and their personal relationship/connection to that place.
+SYSTEM_PROMPT = """You are a location-matching assistant for a memory aid device.
+You will be given a numbered list of known places (#1, #2, ...) with their exact stored descriptions and a Reference Contact Sheet of their photos, followed by a NEW photo taken by the camera right now.
+
+Your ONLY task is to determine which known place (#1, #2, ...) matches the NEW photo, and output that place's number and its EXACT stored description word-for-word.
 
 Strict Rules:
-- The NEW photo comes from a small wearable Raspberry Pi camera, which may have a different camera angle, field of view, zoom, lighting, exposure, or color balance compared to the reference photos (which may have been taken on a phone or from another angle in the same room).
-- Look carefully for shared landmarks, furniture, walls, cabinets, tables, windows, appliances, flooring, or room structure that indicate the user is in the SAME room or place as one of the reference tiles (#1, #2, ...), even from a different angle or distance.
-- Whenever the room or area reasonably corresponds to one of the known places, select that matching place!
-- Do NOT describe the visual scenery, objects, or room layout on your own. Your job is strictly to identify the matching known place and tell the user where they are and their relationship to it using ONLY the facts, names, and relationships in that place's caregiver note.
-- Speak directly to the user ("You're at..." or "You're in..."), stating the place and their personal relationship/routine there based exclusively on the matching caregiver note.
-- Only if the NEW photo is clearly a completely unrelated environment from all provided known places (or if no known places are provided), say: "I don't recognize this place from your memory book yet." Do NOT describe the room or surroundings.
-- Use 1 to 3 short, warm, reassuring sentences in simple everyday words.
-- Never quiz them, never say "you should remember", "don't you remember", or "as you know".
-- Do not mention photos, cameras, notes, AI, or matching.
-- Output only the words to be spoken aloud: no markdown, no lists, no emoji, no quotation marks."""
+- Compare the NEW photo against the Reference Contact Sheet tiles (#1, #2, ...), accounting for differences in camera angle, field of view, distance, and lighting between the onboard camera and the reference photos.
+- Look for shared room features, furniture, cabinets, appliances, walls, windows, or layout cues that show the NEW photo is the same room/location as one of the reference tiles.
+- When you find the matching place #N, you MUST reply with:
+  #N <the exact stored description for #N word-for-word>
+- Do NOT write your own description of the room (NEVER just say "You are in the kitchen" or "You are in the living room"). You must output the exact stored description text associated with that image without changing, adding, or removing any words.
+- If the NEW photo does not match any of the provided places (or if no known places are provided), reply ONLY with:
+  NONE
+- Output plain text only: no markdown, no bullet points, no quotation marks."""
 
 TRANSCRIPTION_PROMPT = (
     "Transcribe exactly what the speaker says in this audio recording about the room or place shown. "
@@ -67,6 +67,68 @@ def clean_spoken_text(text: str) -> str:
         cleaned = cleaned[1:-1].strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip()
+
+
+def resolve_exact_place_description(answer_text: str, places: List[PlaceMemory]) -> str:
+    """Map Gemini's response to the exact verbatim description (`place.note`) from `descriptions.json` / `note.txt`.
+
+    Guarantees that when a location is matched, the spoken response is 100% the exact stored description
+    associated with that image rather than an AI-generated paraphrase.
+    """
+    cleaned = clean_spoken_text(answer_text)
+    if not places:
+        return cleaned
+
+    low = cleaned.lower()
+    if low == "none" or low.startswith("none:") or low.startswith("none ") or "don't recognize" in low or "do not recognize" in low:
+        return MSG_UNRECOGNIZED_PLACE
+
+    # 1. Explicit `#N`, `Tile N`, or `Place N` reference in the model's reply (check raw answer_text too before `#` is stripped)
+    idx_match = re.search(
+        r"(?:#|tile\s+#?|place\s+#?)(\d+)\b", answer_text, flags=re.IGNORECASE
+    ) or re.search(
+        r"(?:#|tile\s+#?|place\s+#?)(\d+)\b", cleaned, flags=re.IGNORECASE
+    )
+    if idx_match:
+        idx = int(idx_match.group(1)) - 1
+        if 0 <= idx < len(places):
+            return places[idx].note
+
+    # Also check if cleaned starts with a bare number like "1: ..." or "2 - ..."
+    leading_num = re.match(r"^(\d+)(?:[\s:.\-)]|$)", cleaned)
+    if leading_num:
+        idx = int(leading_num.group(1)) - 1
+        if 0 <= idx < len(places):
+            return places[idx].note
+
+    # 2. Exact or substring match against any stored note
+    for place in places:
+        note_clean = place.note.strip()
+        if note_clean and (note_clean.lower() == low or note_clean.lower() in low):
+            return note_clean
+
+    # 3. Keyword overlap fallback (in case the model said e.g. "You are in the kitchen" instead of "#2 ...")
+    stop_words = {
+        "this", "that", "is", "are", "the", "a", "an", "your", "you", "in", "at",
+        "on", "to", "for", "of", "and", "or", "where", "with", "from", "it", "here",
+        "room", "place", "web",
+    }
+    answer_words = set(re.findall(r"[a-z0-9]+", low)) - stop_words
+    if answer_words:
+        best_place: Optional[PlaceMemory] = None
+        best_score = 0
+        for place in places:
+            place_words = (
+                set(re.findall(r"[a-z0-9]+", f"{place.name} {place.note}".lower())) - stop_words
+            )
+            score = len(answer_words & place_words)
+            if score > best_score:
+                best_score = score
+                best_place = place
+        if best_place is not None and best_score > 0:
+            return best_place.note
+
+    return cleaned
 
 
 def get_gemini_endpoint(model: str = DEFAULT_MODEL) -> str:
@@ -146,9 +208,9 @@ def build_messages_payload(
         {
             "text": (
                 "Compare the NEW photo above against the Reference Contact Sheet tiles (#1, #2, ...) and "
-                "caregiver notes provided above (accounting for differences in camera angle, field of view, "
-                "and lighting between the onboard Pi camera and reference photos). Do NOT describe the room. "
-                "Using exclusively the matching caregiver note, tell me where I am and my relationship to this place."
+                "caregiver notes provided above. Do NOT describe the room on your own. "
+                "Using exclusively the matching caregiver note, reply with #<number> followed by the EXACT "
+                "stored description word-for-word (or reply NONE if no place matches)."
             ),
         }
     )

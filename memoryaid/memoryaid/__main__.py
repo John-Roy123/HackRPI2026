@@ -11,7 +11,7 @@ from .app import MemoryAidApp
 from .button import GpioButtons, KeyboardButton
 from .camera import MockCamera, PiCamera
 from .config import load_config
-from .memories import load_memories
+from .memories import load_memories, sync_remote_website_memories
 from .speech import AudioRecorder, Speaker
 
 
@@ -83,6 +83,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         config.memories_dir,
         args.mock,
     )
+
+    try:
+        config.captures_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    try:
+        sync_remote_website_memories(
+            memories_dir=config.memories_dir,
+            website_url=config.website_url,
+        )
+    except Exception as exc:
+        logger.warning("Startup website sync skipped: %s", exc)
 
     places = load_memories(config.memories_dir)
 

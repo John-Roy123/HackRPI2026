@@ -31,6 +31,7 @@ from memoryaid.memories import (
 )
 from memoryaid.speech import normalize_electret_wav_bytes, synthesize_fish_audio_wav
 from memoryaid.vision import (
+    MSG_UNRECOGNIZED_PLACE,
     SYSTEM_PROMPT,
     VisionAPIError,
     build_messages_payload,
@@ -38,6 +39,7 @@ from memoryaid.vision import (
     clean_spoken_text,
     get_gemini_endpoint,
     query_vision_api,
+    resolve_exact_place_description,
 )
 
 
@@ -253,6 +255,39 @@ class TestVisionPayloadAndCleaning(unittest.TestCase):
         raw = '  "**You\'re at Joe\'s Cafe.** #cafe _Maria_ is `here`."  '
         cleaned = clean_spoken_text(raw)
         self.assertEqual(cleaned, "You're at Joe's Cafe. cafe Maria is here.")
+
+    def test_resolve_exact_place_description_returns_stored_json_description(self) -> None:
+        places = [
+            PlaceMemory(
+                name="web_living_room_f912baba",
+                note="This is the living room, where you watch football and drink beer!",
+                images_b64=["IMG1"],
+            ),
+            PlaceMemory(
+                name="web_your_kitchen_8ba4aa57",
+                note="This your the kitchen, where you cook food and talk to your wife.",
+                images_b64=["IMG2"],
+            ),
+        ]
+        # Case 1: Model outputs #2 or stripped "2 ..."
+        self.assertEqual(
+            resolve_exact_place_description("#2 This your the kitchen", places),
+            "This your the kitchen, where you cook food and talk to your wife.",
+        )
+        self.assertEqual(
+            resolve_exact_place_description("2 This your the kitchen", places),
+            "This your the kitchen, where you cook food and talk to your wife.",
+        )
+        # Case 2: Model paraphrases ("You are in the kitchen") -> still returns exact JSON description
+        self.assertEqual(
+            resolve_exact_place_description("You are in the kitchen.", places),
+            "This your the kitchen, where you cook food and talk to your wife.",
+        )
+        # Case 3: Model outputs NONE
+        self.assertEqual(
+            resolve_exact_place_description("NONE", places),
+            MSG_UNRECOGNIZED_PLACE,
+        )
 
     @patch("memoryaid.vision.requests.get")
     @patch("memoryaid.vision.requests.post")
