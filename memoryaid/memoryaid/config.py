@@ -59,6 +59,7 @@ class Config:
     fish_reference_id: str = ""
     fish_model: str = ""
     model: str = "gemini-3-flash-preview"
+    website_url: str = "http://localhost:5173"
     bluetooth_mac: str = ""
     audio_device: str = "default"
     record_device: str = "auto"
@@ -67,8 +68,9 @@ class Config:
     button_pin: int = 17
     record_button_pin: int = 27
     memories_dir: Path = Path("memories")
-    save_last_capture: bool = False
+    save_last_capture: bool = True
     last_capture_path: Path = Path("last_capture.jpg")
+    captures_dir: Path = Path("captured_photos")
 
     @property
     def has_api_key(self) -> bool:
@@ -109,6 +111,7 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
         "FISH_VOICE_ID",
         "FISH_MODEL",
         "MODEL",
+        "WEBSITE_URL",
         "BLUETOOTH_MAC",
         "AUDIO_DEVICE",
         "RECORD_DEVICE",
@@ -139,6 +142,8 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
             model,
         )
         model = "gemini-3-flash-preview"
+
+    website_url = merged.get("WEBSITE_URL", "http://localhost:5173").strip().rstrip("/")
     bluetooth_mac = merged.get("BLUETOOTH_MAC", "").strip().upper()
     audio_device = merged.get("AUDIO_DEVICE", "").strip()
     if not audio_device:
@@ -163,8 +168,9 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
     else:
         memories_dir = (project_root / "memories").resolve()
 
-    save_last_capture = _parse_bool(merged.get("SAVE_LAST_CAPTURE", "false"))
+    save_last_capture = _parse_bool(merged.get("SAVE_LAST_CAPTURE", "true"))
     last_capture_path = (project_root / "last_capture.jpg").resolve()
+    captures_dir = (project_root / "captured_photos").resolve()
 
     return Config(
         gemini_api_key=api_key,
@@ -172,6 +178,7 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
         fish_reference_id=fish_reference_id,
         fish_model=fish_model,
         model=model,
+        website_url=website_url,
         bluetooth_mac=bluetooth_mac,
         audio_device=audio_device,
         record_device=record_device,
@@ -182,4 +189,5 @@ def load_config(env_file: Optional[Path] = None, project_root: Optional[Path] = 
         memories_dir=memories_dir,
         save_last_capture=save_last_capture,
         last_capture_path=last_capture_path,
+        captures_dir=captures_dir,
     )

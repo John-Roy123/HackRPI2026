@@ -7,11 +7,14 @@ import json
 import logging
 import math
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote
 
+import requests
 from PIL import Image, ImageDraw, ImageOps
 
 logger = logging.getLogger("memoryaid")
@@ -20,10 +23,10 @@ ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 MAX_PLACES = 10
 MAX_PHOTOS_PER_PLACE = 2
 REF_MAX_EDGE = 512
-REF_JPEG_QUALITY = 75
-GRID_TILE_WIDTH = 320
-GRID_TILE_HEIGHT = 240
-GRID_JPEG_QUALITY = 78
+REF_JPEG_QUALITY = 82
+GRID_TILE_WIDTH = 480
+GRID_TILE_HEIGHT = 360
+GRID_JPEG_QUALITY = 85
 
 
 @dataclass
@@ -68,10 +71,12 @@ def preprocess_image_file_to_b64(
 def build_contact_sheet_b64(
     places: List[PlaceMemory],
     cache_dir: Optional[Path] = None,
+    captures_dir: Optional[Path] = None,
 ) -> Optional[str]:
     """Stitch all reference photos across `places` into a single labeled contact-sheet grid JPEG (base64).
 
     Each tile is labeled in the top-left corner with `#<place_index> <place_name>` (e.g., `#1 joes_cafe`).
+    Also saves a viewable copy to `captured_photos/reference_contact_sheet.jpg` when `captures_dir` is provided.
     Returns None if no place has any reference photos.
     """
     tiles: List[Tuple[int, str, str]] = []
@@ -84,6 +89,7 @@ def build_contact_sheet_b64(
 
     # Compute a fingerprint over all tile base64 strings + labels so we can reuse the cached grid on disk
     sig_hasher = hashlib.sha256()
+    sig_hasher.update(f"v2:{GRID_TILE_WIDTH}x{GRID_TILE_HEIGHT}:".encode("utf-8"))
     for place_idx, place_name, img_b64 in tiles:
         sig_hasher.update(f"{place_idx}:{place_name}:".encode("utf-8"))
         sig_hasher.update(img_b64.encode("ascii"))
@@ -95,12 +101,21 @@ def build_contact_sheet_b64(
             try:
                 cached = json.loads(grid_cache_file.read_text(encoding="utf-8"))
                 if isinstance(cached.get("b64"), str) and cached["b64"]:
-                    return str(cached["b64"])
+                    sheet_b64_cached = str(cached["b64"])
+                    if captures_dir is not None:
+                        try:
+                            captures_dir.mkdir(parents=True, exist_ok=True)
+                            (captures_dir / "reference_contact_sheet.jpg").write_bytes(
+                                base64.b64decode(sheet_b64_cached)
+                            )
+                        except OSError:
+                            pass
+                    return sheet_b64_cached
             except Exception:
                 pass
 
     num_tiles = len(tiles)
-    cols = min(4, max(1, int(math.ceil(math.sqrt(num_tiles)))))
+    cols = min(3, max(1, int(math.ceil(math.sqrt(num_tiles)))))
     rows = int(math.ceil(num_tiles / float(cols)))
 
     canvas_w = cols * GRID_TILE_WIDTH
@@ -117,25 +132,28 @@ def build_contact_sheet_b64(
         try:
             raw = base64.b64decode(img_b64)
             with Image.open(io.BytesIO(raw)) as tile_img:
-                fitted = ImageOps.fit(
+                # Use contain() rather than fit() so portrait phone photos are never cropped
+                contained = ImageOps.contain(
                     tile_img.convert("RGB"),
-                    (GRID_TILE_WIDTH - 4, GRID_TILE_HEIGHT - 4),
+                    (GRID_TILE_WIDTH - 8, GRID_TILE_HEIGHT - 32),
                     method=resample,
                 )
-                sheet.paste(fitted, (x0 + 2, y0 + 2))
+                pad_x = x0 + (GRID_TILE_WIDTH - contained.width) // 2
+                pad_y = y0 + 26 + (GRID_TILE_HEIGHT - 30 - contained.height) // 2
+                sheet.paste(contained, (pad_x, pad_y))
         except Exception as exc:
             logger.warning("Could not render contact-sheet tile for %s: %s", place_name, exc)
 
-        # Draw high-contrast label banner `#N place_name` at the top-left of the tile
+        # Draw high-contrast label banner `#N place_name` across the top header bar of the tile
         draw = ImageDraw.Draw(sheet)
-        label = f"#{place_idx} {place_name}"[:28]
-        banner_w = min(GRID_TILE_WIDTH - 4, max(70, len(label) * 7 + 12))
-        draw.rectangle([x0 + 2, y0 + 2, x0 + 2 + banner_w, y0 + 22], fill=(0, 0, 0))
-        draw.text((x0 + 8, y0 + 6), label, fill=(255, 255, 100))
+        label = f"#{place_idx} {place_name}"[:36]
+        draw.rectangle([x0 + 2, y0 + 2, x0 + GRID_TILE_WIDTH - 2, y0 + 24], fill=(0, 0, 0))
+        draw.text((x0 + 8, y0 + 7), label, fill=(255, 255, 100))
 
     buf = io.BytesIO()
     sheet.save(buf, format="JPEG", quality=GRID_JPEG_QUALITY, optimize=True)
-    sheet_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    sheet_bytes = buf.getvalue()
+    sheet_b64 = base64.b64encode(sheet_bytes).decode("ascii")
 
     if cache_dir is not None:
         try:
@@ -153,12 +171,21 @@ def build_contact_sheet_b64(
         except OSError:
             pass
 
+    if captures_dir is not None:
+        try:
+            captures_dir.mkdir(parents=True, exist_ok=True)
+            ref_sheet_path = captures_dir / "reference_contact_sheet.jpg"
+            ref_sheet_path.write_bytes(sheet_bytes)
+            logger.info("Saved reference contact sheet image -> %s", ref_sheet_path)
+        except OSError:
+            pass
+
     logger.info(
         "Built composite contact-sheet grid (%d tile(s) across %dx%d grid, %.1f KB).",
         num_tiles,
         cols,
         rows,
-        len(buf.getvalue()) / 1024.0,
+        len(sheet_bytes) / 1024.0,
     )
     return sheet_b64
 
@@ -232,6 +259,194 @@ def save_recorded_memory(
         target_photo, max_edge=REF_MAX_EDGE, quality=REF_JPEG_QUALITY
     )
     return PlaceMemory(name=slug, note=clean_note, images_b64=[ref_b64])
+
+
+def sync_remote_website_memories(
+    memories_dir: Path,
+    website_url: str = "",
+    timeout: float = 5.0,
+) -> bool:
+    """Sync new/updated photos and descriptions from the HackRPI2026 Caregiver Website into `memories_dir`.
+
+    1. If `website_url` is reachable (`GET <website_url>/api/photos`), downloads any new photos from
+       `<website_url>/images/<filename>` and writes their descriptions into `memories/web_<slug>_<shortid>/note.txt`.
+    2. If `website_url` is unreachable or local, also checks for a sibling `../HackRPI2026/descriptions.json` +
+       `../HackRPI2026/images/` directory on disk and imports any new entries automatically.
+
+    Returns True if any place was added, updated, or removed on disk (so the caller knows to reload `memories/`
+    and rebuild the Contact Sheet), or False if nothing changed.
+    """
+    memories_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = memories_dir / ".cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = cache_dir / "website_sync_state.json"
+
+    prev_state: Dict[str, Dict[str, Any]] = {}
+    if manifest_path.is_file():
+        try:
+            loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                prev_state = loaded
+        except Exception:
+            prev_state = {}
+
+    records: Optional[List[Dict[str, Any]]] = None
+    source_mode = ""  # "http" or "local"
+    local_web_root: Optional[Path] = None
+
+    clean_url = (website_url or "").strip().rstrip("/")
+    if clean_url:
+        try:
+            resp = requests.get(f"{clean_url}/api/photos", timeout=timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list):
+                    records = data
+                    source_mode = "http"
+        except Exception as exc:
+            logger.debug("Website HTTP sync from %s skipped/unreachable: %s", clean_url, exc)
+
+    # Fallback: check local sibling `HackRPI2026/descriptions.json` if running on same machine or synced folder
+    if records is None:
+        candidate_roots = [
+            memories_dir.parent.parent / "HackRPI2026",
+            memories_dir.parent / "HackRPI2026",
+        ]
+        for cand in candidate_roots:
+            desc_file = cand / "descriptions.json"
+            if desc_file.is_file():
+                try:
+                    data = json.loads(desc_file.read_text(encoding="utf-8"))
+                    if isinstance(data, list):
+                        records = data
+                        source_mode = "local"
+                        local_web_root = cand
+                        break
+                except Exception as exc:
+                    logger.warning("Failed reading local %s: %s", desc_file, exc)
+
+    if records is None:
+        return False
+
+    changed = False
+    new_state: Dict[str, Dict[str, Any]] = {}
+
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        photo_id = str(item.get("id") or "").strip()
+        filename = str(item.get("filename") or "").strip()
+        description = str(item.get("description") or "").strip()
+        updated_at = str(item.get("updatedAt") or item.get("uploadedAt") or "").strip()
+
+        if not photo_id or not filename:
+            continue
+
+        short_id = re.sub(r"[^a-z0-9]", "", photo_id.lower())[:8] or "web"
+        slug_base = slugify_place_name(description or Path(filename).stem)
+        folder_name = f"web_{slug_base}_{short_id}"
+        place_dir = memories_dir / folder_name
+        ext = Path(filename).suffix.lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            ext = ".jpg"
+        target_photo = place_dir / f"1{ext}"
+        target_note = place_dir / "note.txt"
+
+        prev_entry = prev_state.get(photo_id)
+        already_up_to_date = (
+            prev_entry is not None
+            and prev_entry.get("folder") == folder_name
+            and prev_entry.get("description") == description
+            and prev_entry.get("updated_at") == updated_at
+            and prev_entry.get("filename") == filename
+            and target_photo.is_file()
+            and target_note.is_file()
+        )
+        if already_up_to_date:
+            new_state[photo_id] = prev_entry
+            continue
+
+        # If the description changed and produced a new folder name, remove the old folder first
+        if prev_entry and prev_entry.get("folder") and prev_entry.get("folder") != folder_name:
+            old_dir = memories_dir / str(prev_entry["folder"])
+            if old_dir.is_dir() and old_dir.name.startswith("web_"):
+                shutil.rmtree(old_dir, ignore_errors=True)
+
+        # Fetch or copy the image if not already present on disk
+        img_bytes: Optional[bytes] = None
+        if not target_photo.is_file() or (prev_entry and prev_entry.get("filename") != filename):
+            if source_mode == "http":
+                try:
+                    img_url = f"{clean_url}/images/{quote(filename)}"
+                    img_resp = requests.get(img_url, timeout=timeout)
+                    if img_resp.status_code == 200 and img_resp.content:
+                        img_bytes = img_resp.content
+                    else:
+                        logger.warning("Website image download failed (%d) for %s", img_resp.status_code, img_url)
+                        continue
+                except Exception as exc:
+                    logger.warning("Error downloading website image %s: %s", filename, exc)
+                    continue
+            elif source_mode == "local" and local_web_root is not None:
+                src_file = local_web_root / "images" / Path(filename).name
+                if src_file.is_file():
+                    try:
+                        img_bytes = src_file.read_bytes()
+                    except OSError as exc:
+                        logger.warning("Could not read local website image %s: %s", src_file, exc)
+                        continue
+                else:
+                    continue
+
+        place_dir.mkdir(parents=True, exist_ok=True)
+        if img_bytes is not None:
+            # Convert/normalize through Pillow so any WebP/BMP/GIF/JPEG from the website becomes a valid JPEG/PNG
+            try:
+                with Image.open(io.BytesIO(img_bytes)) as raw_img:
+                    jpeg_bytes = preprocess_image_bytes(
+                        raw_img, max_edge=REF_MAX_EDGE, quality=REF_JPEG_QUALITY
+                    )
+                target_photo = place_dir / "1.jpg"
+                target_photo.write_bytes(jpeg_bytes)
+            except Exception as exc:
+                logger.warning("Skipping invalid website image %s: %s", filename, exc)
+                continue
+
+        note_content = description if description else slug_base.replace("_", " ")
+        target_note.write_text(note_content + "\n", encoding="utf-8")
+
+        new_state[photo_id] = {
+            "folder": folder_name,
+            "filename": filename,
+            "description": description,
+            "updated_at": updated_at,
+        }
+        changed = True
+        logger.info(
+            "Synced website memory [%s]: folder=%s, note=%r",
+            source_mode,
+            folder_name,
+            note_content,
+        )
+
+    # Remove any `web_*` folders that were deleted from the website
+    for old_id, old_entry in prev_state.items():
+        if old_id not in new_state:
+            old_folder = str(old_entry.get("folder") or "")
+            if old_folder.startswith("web_"):
+                old_path = memories_dir / old_folder
+                if old_path.is_dir():
+                    shutil.rmtree(old_path, ignore_errors=True)
+                    changed = True
+                    logger.info("Removed deleted website memory folder: %s", old_folder)
+
+    if changed or set(prev_state.keys()) != set(new_state.keys()):
+        try:
+            manifest_path.write_text(json.dumps(new_state, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    return changed
 
 
 def _cache_key_for_source(source_path: Path, root_dir: Path) -> str:
@@ -364,6 +579,17 @@ def load_memories(memories_dir: Path) -> List[PlaceMemory]:
             except Exception as exc:
                 logger.error("Skipping unreadable photo %s: %s", photo, exc)
 
+        if not images_b64:
+            if folder.name in ("davids_bedroom", "joes_cafe"):
+                shutil.rmtree(folder, ignore_errors=True)
+                logger.info("Removed empty sample folder '%s'.", folder.name)
+                continue
+            logger.info(
+                "Place folder '%s' has no reference photos yet; skipping.",
+                folder.name,
+            )
+            continue
+
         places.append(
             PlaceMemory(
                 name=folder.name,
@@ -371,20 +597,22 @@ def load_memories(memories_dir: Path) -> List[PlaceMemory]:
                 images_b64=images_b64,
             )
         )
-        if not images_b64:
-            logger.info(
-                "Place folder '%s' has no reference photos yet; loaded caregiver note only.",
-                folder.name,
-            )
 
     # Prune stale cache entries so removed photos do not linger on disk
     if cache_dir.is_dir():
         for cached_file in cache_dir.glob("*.json"):
-            if not cached_file.stem.startswith("contact_sheet_") and cached_file.stem not in active_cache_keys:
+            if (
+                not cached_file.stem.startswith("contact_sheet_")
+                and cached_file.name != "website_sync_state.json"
+                and cached_file.stem not in active_cache_keys
+            ):
                 try:
                     cached_file.unlink()
                 except OSError:
                     pass
+
+    # Sort places that actually have reference photos ahead of empty note-only placeholder folders
+    places.sort(key=lambda p: (0 if p.images_b64 else 1, p.name.lower()))
 
     total_photos = sum(len(p.images_b64) for p in places)
     logger.info(

@@ -32,15 +32,17 @@ _DISCOVERED_MODEL: str = ""
 _FAILED_404_MODELS: set = set()
 
 SYSTEM_PROMPT = """You are a gentle memory companion carried by a person living with dementia.
-You will be given a set of known places from their memory book (each with reference photos and a caregiver's note/description), followed by a NEW photo taken by their camera right now.
+You will be given a set of known places from their memory book (each with reference photos and a caregiver's note/description), followed by a NEW photo taken by their onboard Raspberry Pi camera right now.
 
 Your ONLY task is to compare the NEW photo against the provided reference photos and caregiver notes, and from EXCLUSIVELY that provided information determine which known place the user is in and their personal relationship/connection to that place.
 
 Strict Rules:
+- The NEW photo comes from a small wearable Raspberry Pi camera, which may have a different camera angle, field of view, zoom, lighting, exposure, or color balance compared to the reference photos (which may have been taken on a phone or from another angle in the same room).
+- Look carefully for shared landmarks, furniture, walls, cabinets, tables, windows, appliances, flooring, or room structure that indicate the user is in the SAME room or place as one of the reference tiles (#1, #2, ...), even from a different angle or distance.
+- Whenever the room or area reasonably corresponds to one of the known places, select that matching place!
 - Do NOT describe the visual scenery, objects, or room layout on your own. Your job is strictly to identify the matching known place and tell the user where they are and their relationship to it using ONLY the facts, names, and relationships in that place's caregiver note.
-- Compare the NEW photo carefully against the reference photos and caregiver notes to find the matching known place.
 - Speak directly to the user ("You're at..." or "You're in..."), stating the place and their personal relationship/routine there based exclusively on the matching caregiver note.
-- If the NEW photo does not match any of the provided known places (or if no known places are provided), simply say: "I don't recognize this place from your memory book yet." Do NOT describe the room or surroundings.
+- Only if the NEW photo is clearly a completely unrelated environment from all provided known places (or if no known places are provided), say: "I don't recognize this place from your memory book yet." Do NOT describe the room or surroundings.
 - Use 1 to 3 short, warm, reassuring sentences in simple everyday words.
 - Never quiz them, never say "you should remember", "don't you remember", or "as you know".
 - Do not mention photos, cameras, notes, AI, or matching.
@@ -143,9 +145,10 @@ def build_messages_payload(
     parts.append(
         {
             "text": (
-                "Compare the NEW photo above strictly against the Reference Contact Sheet tiles (#1, #2, ...) and "
-                "caregiver notes provided above. Do NOT describe the room. Using exclusively the matching caregiver "
-                "note, tell me where I am and my relationship to this place."
+                "Compare the NEW photo above against the Reference Contact Sheet tiles (#1, #2, ...) and "
+                "caregiver notes provided above (accounting for differences in camera angle, field of view, "
+                "and lighting between the onboard Pi camera and reference photos). Do NOT describe the room. "
+                "Using exclusively the matching caregiver note, tell me where I am and my relationship to this place."
             ),
         }
     )
@@ -377,7 +380,12 @@ def query_vision_api(
                     if not cleaned:
                         raise VisionAPIError("Gemini API returned empty text content.")
                     _DISCOVERED_MODEL = current_model
-                    logger.info("Gemini API succeeded with model=%s in %.2fs", current_model, latency)
+                    logger.info(
+                        "Gemini API succeeded with model=%s in %.2fs -> %r",
+                        current_model,
+                        latency,
+                        cleaned,
+                    )
                     return cleaned, payload_size_bytes, latency
 
                 if status == 404:
