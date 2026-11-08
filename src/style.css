@@ -72,6 +72,13 @@ textarea {
   margin-bottom: 40px;
 }
 
+.logo {
+  display: block;
+  width: min(240px, 60vw);
+  height: auto;
+  margin: 0 auto 28px;
+}
+
 h1,
 .gallery-head h2 {
   font-family: var(--serif);

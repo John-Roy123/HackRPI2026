@@ -1,4 +1,3 @@
-import './style.css'
 import { ACCEPTED_TYPES, MAX_DESCRIPTION, MAX_FILE_BYTES } from './limits.js'
 
 // ---------- Small helpers ----------
