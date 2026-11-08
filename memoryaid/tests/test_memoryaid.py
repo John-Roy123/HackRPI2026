@@ -219,7 +219,7 @@ class TestVisionPayloadAndCleaning(unittest.TestCase):
             get_gemini_endpoint("claude-haiku-5-5"),
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent",
         )
-        self.assertEqual(payload["generationConfig"]["maxOutputTokens"], 200)
+        self.assertEqual(payload["generationConfig"]["maxOutputTokens"], 2048)
         self.assertEqual(payload["system_instruction"]["parts"][0]["text"], SYSTEM_PROMPT)
         self.assertEqual(len(payload["contents"]), 1)
         self.assertEqual(payload["contents"][0]["role"], "user")

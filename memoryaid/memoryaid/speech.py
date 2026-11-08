@@ -375,7 +375,28 @@ def synthesize_fish_audio_wav(
     if not wav_bytes or len(wav_bytes) <= 44:
         raise RuntimeError("Fish Audio returned empty WAV audio data.")
 
-    return wav_bytes
+    return _pad_wav_trailing_silence(wav_bytes, pad_seconds=0.35)
+
+
+def _pad_wav_trailing_silence(wav_bytes: bytes, pad_seconds: float = 0.35) -> bytes:
+    """Append trailing silence to a WAV buffer so Bluetooth A2DP / pw-play never clips the last word."""
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            nchannels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            raw_frames = wf.readframes(wf.getnframes())
+        pad_frames = int(framerate * pad_seconds)
+        silence = b"\x00" * (pad_frames * nchannels * sampwidth)
+        out_buf = io.BytesIO()
+        with wave.open(out_buf, "wb") as out_wf:
+            out_wf.setnchannels(nchannels)
+            out_wf.setsampwidth(sampwidth)
+            out_wf.setframerate(framerate)
+            out_wf.writeframes(raw_frames + silence)
+        return out_buf.getvalue()
+    except Exception:
+        return wav_bytes
 
 
 class AudioRecorder:

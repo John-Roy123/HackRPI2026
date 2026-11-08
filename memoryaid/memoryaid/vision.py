@@ -25,7 +25,7 @@ FALLBACK_MODELS = (
     "gemini-2.5-pro",
     "gemini-2.5-flash",
 )
-MAX_OUTPUT_TOKENS = 200
+MAX_OUTPUT_TOKENS = 2048
 REQUEST_TIMEOUT_SECONDS = 30
 RETRY_DELAY_SECONDS = 2.0
 _DISCOVERED_MODEL: str = ""
@@ -436,8 +436,15 @@ def query_vision_api(
                     candidates = data.get("candidates") or []
                     if not candidates:
                         raise VisionAPIError("Gemini API returned no candidates.")
+                    finish_reason = candidates[0].get("finishReason", "")
+                    if finish_reason and finish_reason not in ("STOP", "FINISH_REASON_UNSPECIFIED"):
+                        logger.warning("Gemini API finishReason=%s", finish_reason)
                     parts = candidates[0].get("content", {}).get("parts") or []
-                    raw_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+                    raw_text = "".join(
+                        p.get("text", "")
+                        for p in parts
+                        if isinstance(p, dict) and not p.get("thought")
+                    )
                     cleaned = clean_spoken_text(raw_text)
                     if not cleaned:
                         raise VisionAPIError("Gemini API returned empty text content.")
