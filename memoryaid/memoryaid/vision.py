@@ -25,7 +25,7 @@ FALLBACK_MODELS = (
     "gemini-2.5-pro",
     "gemini-2.5-flash",
 )
-MAX_OUTPUT_TOKENS = 200
+MAX_OUTPUT_TOKENS = 2048
 REQUEST_TIMEOUT_SECONDS = 30
 RETRY_DELAY_SECONDS = 2.0
 _DISCOVERED_MODEL: str = ""
@@ -436,8 +436,15 @@ def query_vision_api(
                     candidates = data.get("candidates") or []
                     if not candidates:
                         raise VisionAPIError("Gemini API returned no candidates.")
+                    finish_reason = candidates[0].get("finishReason", "")
+                    if finish_reason and finish_reason not in ("STOP", "FINISH_REASON_UNSPECIFIED"):
+                        logger.warning("Gemini API finishReason=%s", finish_reason)
                     parts = candidates[0].get("content", {}).get("parts") or []
-                    raw_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+                    raw_text = "".join(
+                        p.get("text", "")
+                        for p in parts
+                        if isinstance(p, dict) and not p.get("thought")
+                    )
                     cleaned = clean_spoken_text(raw_text)
                     if not cleaned:
                         raise VisionAPIError("Gemini API returned empty text content.")
@@ -468,7 +475,23 @@ def query_vision_api(
                     last_error = VisionAPIError(f"HTTP 404 model not found ({current_model}): {err_detail}")
                     break  # Try next candidate model immediately
 
-                if status == 429 or status >= 500:
+                if status == 429:
+                    err_detail = (response.text or "")[:200].strip()
+                    last_error = VisionAPIError(f"HTTP 429 rate limit ({current_model}): {err_detail}")
+                    if _DISCOVERED_MODEL == current_model:
+                        _DISCOVERED_MODEL = ""
+                    logger.warning(
+                        "Gemini model %r hit HTTP 429 rate limit; switching to next Gemini model bucket...",
+                        current_model,
+                    )
+                    if not discovered_once:
+                        discovered_once = True
+                        for dm in reversed(_discover_available_gemini_MODELS(clean_key)):
+                            if dm not in candidate_models and dm not in _FAILED_404_MODELS:
+                                candidate_models.insert(idx, dm)
+                    break  # Try next model bucket immediately
+
+                if status >= 500:
                     last_error = VisionAPIError(f"HTTP {status} from Gemini API")
                     if attempt == 1:
                         logger.warning(

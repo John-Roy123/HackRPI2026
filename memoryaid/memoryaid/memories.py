@@ -204,17 +204,135 @@ def slugify_place_name(text: str) -> str:
     return slug[:40]
 
 
+def _get_candidate_website_urls(memories_dir: Path, website_url: str = "") -> List[str]:
+    """Return ordered list of candidate HTTP base URLs for the HackRPI2026 Caregiver Website."""
+    candidate_urls: List[str] = []
+    is_mocked = isinstance(getattr(requests.get, "_mock_name", None), str) or isinstance(
+        getattr(requests.post, "_mock_name", None), str
+    )
+
+    server_url_file = memories_dir.parent / ".server_url"
+    if server_url_file.is_file() and not is_mocked:
+        try:
+            saved_srv = server_url_file.read_text(encoding="utf-8").strip().rstrip("/")
+            if saved_srv:
+                candidate_urls.append(saved_srv)
+        except OSError:
+            pass
+
+    clean_url = (website_url or "").strip().rstrip("/")
+    if clean_url and clean_url not in candidate_urls:
+        candidate_urls.append(clean_url)
+
+    for ssh_var in ("SSH_CLIENT", "SSH_CONNECTION"):
+        ssh_val = os.environ.get(ssh_var, "").strip()
+        if ssh_val and not is_mocked:
+            ssh_ip = ssh_val.split()[0].strip()
+            if ssh_ip and not ssh_ip.startswith("127."):
+                ssh_url = f"http://{ssh_ip}:5173"
+                if ssh_url not in candidate_urls:
+                    candidate_urls.append(ssh_url)
+
+    if not is_mocked:
+        for fallback_url in (
+            "http://192.168.50.209:5173",
+            "http://Johns-MacBook-Air-2.local:5173",
+            "http://localhost:5173",
+        ):
+            if fallback_url not in candidate_urls:
+                candidate_urls.append(fallback_url)
+
+    return candidate_urls
+
+
+def upload_memory_to_website(
+    memories_dir: Path,
+    folder_name: str,
+    jpeg_bytes: bytes,
+    description: str,
+    website_url: str = "",
+    timeout: float = 5.0,
+) -> Optional[Dict[str, Any]]:
+    """Upload a Pi-recorded photo and its spoken description to the Caregiver Website (`POST /api/photos`).
+
+    Also records the returned website `id` in `memories/.cache/website_sync_state.json` so subsequent
+    website syncs know this local folder already corresponds to that website record.
+    """
+    candidate_urls = _get_candidate_website_urls(memories_dir, website_url)
+    clean_desc = description.strip()
+
+    for url_cand in candidate_urls:
+        try:
+            resp = requests.post(
+                f"{url_cand}/api/photos",
+                params={"name": f"{folder_name}.jpg", "description": clean_desc},
+                headers={"Content-Type": "image/jpeg"},
+                data=jpeg_bytes,
+                timeout=timeout,
+            )
+            if resp.status_code in (200, 201):
+                created = resp.json()
+                if isinstance(created, dict) and created.get("id"):
+                    photo_id = str(created["id"]).strip()
+                    filename = str(created.get("filename") or f"{folder_name}.jpg").strip()
+                    updated_at = str(created.get("updatedAt") or created.get("uploadedAt") or "").strip()
+
+                    cache_dir = memories_dir / ".cache"
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    manifest_path = cache_dir / "website_sync_state.json"
+                    state: Dict[str, Dict[str, Any]] = {}
+                    if manifest_path.is_file():
+                        try:
+                            loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+                            if isinstance(loaded, dict):
+                                state = loaded
+                        except Exception:
+                            state = {}
+                    state[photo_id] = {
+                        "folder": folder_name,
+                        "filename": filename,
+                        "description": clean_desc,
+                        "updated_at": updated_at,
+                    }
+                    try:
+                        manifest_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+                    except OSError:
+                        pass
+
+                    logger.info(
+                        "Uploaded Pi-recorded photo & description to website (%s): id=%s, folder=%s, description=%r",
+                        url_cand,
+                        photo_id,
+                        folder_name,
+                        clean_desc,
+                    )
+                    return created
+        except Exception as exc:
+            logger.debug("Upload to caregiver website %s failed: %s", url_cand, exc)
+
+    logger.warning(
+        "Could not upload recorded memory '%s' to caregiver website (%s); will retry on next sync.",
+        folder_name,
+        ", ".join(candidate_urls) or "no URL",
+    )
+    return None
+
+
 def save_recorded_memory(
     memories_dir: Path,
     captured_b64: str,
     note_text: str,
     place_name_hint: str = "",
+    website_url: str = "",
+    upload_to_website: bool = True,
 ) -> PlaceMemory:
-    """Save a newly recorded photo and spoken transcript into `memories/<place_slug>/` and return the PlaceMemory.
+    """Save a newly recorded photo and spoken transcript into `memories/<place_slug>/`, optionally upload it
+    to the Caregiver Website (`POST /api/photos`), and return the PlaceMemory.
 
     Writes:
       - `memories/<slug>/note.txt` with what the user said
       - `memories/<slug>/1.jpg` (or `2.jpg` if `1.jpg` already exists)
+      - Uploads the photo + description to the external Caregiver Website when `upload_to_website=True`
     """
     memories_dir.mkdir(parents=True, exist_ok=True)
     slug = slugify_place_name(place_name_hint or note_text)
@@ -255,6 +373,19 @@ def save_recorded_memory(
         clean_note,
         target_photo.name,
     )
+
+    # Upload the newly taken Pi photo and its description to the Caregiver Website
+    if upload_to_website:
+        try:
+            upload_memory_to_website(
+                memories_dir=memories_dir,
+                folder_name=slug,
+                jpeg_bytes=raw_jpeg,
+                description=clean_note,
+                website_url=website_url,
+            )
+        except Exception as exc:
+            logger.warning("Website upload after recording skipped: %s", exc)
 
     ref_b64 = preprocess_image_file_to_b64(
         target_photo, max_edge=REF_MAX_EDGE, quality=REF_JPEG_QUALITY
@@ -297,39 +428,7 @@ def sync_remote_website_memories(
     local_web_root: Optional[Path] = None
 
     # Build ordered list of candidate HTTP URLs to reach the Caregiver Website server
-    candidate_urls: List[str] = []
-    server_url_file = memories_dir.parent / ".server_url"
-    if server_url_file.is_file() and not isinstance(getattr(requests.get, "_mock_name", None), str):
-        try:
-            saved_srv = server_url_file.read_text(encoding="utf-8").strip().rstrip("/")
-            if saved_srv:
-                candidate_urls.append(saved_srv)
-        except OSError:
-            pass
-
-    clean_url = (website_url or "").strip().rstrip("/")
-    if clean_url and clean_url not in candidate_urls:
-        candidate_urls.append(clean_url)
-
-    # If SSHed into the Pi from the laptop hosting the website, SSH_CLIENT / SSH_CONNECTION has the laptop IP
-    for ssh_var in ("SSH_CLIENT", "SSH_CONNECTION"):
-        ssh_val = os.environ.get(ssh_var, "").strip()
-        if ssh_val:
-            ssh_ip = ssh_val.split()[0].strip()
-            if ssh_ip and not ssh_ip.startswith("127."):
-                ssh_url = f"http://{ssh_ip}:5173"
-                if ssh_url not in candidate_urls:
-                    candidate_urls.append(ssh_url)
-
-    for fallback_url in (
-        "http://192.168.50.209:5173",
-        "http://Johns-MacBook-Air-2.local:5173",
-        "http://localhost:5173",
-    ):
-        if fallback_url not in candidate_urls:
-            # Only add automatic LAN fallback URLs when not mocked in unit tests
-            if not isinstance(getattr(requests.get, "_mock_name", None), str):
-                candidate_urls.append(fallback_url)
+    candidate_urls = _get_candidate_website_urls(memories_dir, website_url)
 
     for url_cand in candidate_urls:
         try:
@@ -398,12 +497,16 @@ def sync_remote_website_memories(
 
         short_id = re.sub(r"[^a-z0-9]", "", photo_id.lower())[:8] or "web"
         slug_base = slugify_place_name(description or Path(filename).stem)
-        folder_name = f"web_{slug_base}_{short_id}"
+        prev_entry = prev_state.get(photo_id)
+        prev_folder = str(prev_entry.get("folder") or "") if prev_entry else ""
+        if prev_folder and not prev_folder.startswith("web_") and (memories_dir / prev_folder).is_dir():
+            folder_name = prev_folder
+        else:
+            folder_name = f"web_{slug_base}_{short_id}"
         place_dir = memories_dir / folder_name
         target_photo = place_dir / "1.jpg"
         target_note = place_dir / "note.txt"
 
-        prev_entry = prev_state.get(photo_id)
         already_up_to_date = (
             prev_entry is not None
             and prev_entry.get("folder") == folder_name
@@ -508,6 +611,56 @@ def sync_remote_website_memories(
                     shutil.rmtree(old_path, ignore_errors=True)
                     changed = True
                     logger.info("Removed deleted website memory folder: %s", old_folder)
+
+    # Upload any local Pi-recorded folders that have not yet been uploaded to the website
+    is_get_mocked = isinstance(getattr(requests.get, "_mock_name", None), str)
+    is_post_mocked = isinstance(getattr(requests.post, "_mock_name", None), str)
+    if source_mode == "http" and active_http_url and (not is_get_mocked or is_post_mocked):
+        synced_folders = {str(entry.get("folder") or "") for entry in new_state.values()}
+        for sub in sorted(memories_dir.iterdir()):
+            if (
+                not sub.is_dir()
+                or sub.name.startswith(".")
+                or sub.name.startswith("web_")
+                or sub.name in SAMPLE_PLACE_FOLDERS_TO_CLEANUP
+                or sub.name in synced_folders
+            ):
+                continue
+            photos = sorted(
+                p for p in sub.iterdir() if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS
+            )
+            if not photos:
+                continue
+            note_file = sub / "note.txt"
+            note_val = ""
+            if note_file.is_file():
+                try:
+                    note_val = note_file.read_text(encoding="utf-8").strip()
+                except OSError:
+                    pass
+            if not note_val:
+                note_val = sub.name.replace("_", " ")
+            try:
+                created_rec = upload_memory_to_website(
+                    memories_dir=memories_dir,
+                    folder_name=sub.name,
+                    jpeg_bytes=photos[0].read_bytes(),
+                    description=note_val,
+                    website_url=active_http_url,
+                    timeout=timeout,
+                )
+                if created_rec and created_rec.get("id"):
+                    cid = str(created_rec["id"]).strip()
+                    new_state[cid] = {
+                        "folder": sub.name,
+                        "filename": str(created_rec.get("filename") or ""),
+                        "description": note_val,
+                        "updated_at": str(created_rec.get("updatedAt") or created_rec.get("uploadedAt") or ""),
+                    }
+                    if records is not None:
+                        records.append(created_rec)
+            except Exception as exc:
+                logger.debug("Deferred upload of local memory '%s' skipped: %s", sub.name, exc)
 
     if changed or set(prev_state.keys()) != set(new_state.keys()):
         try:

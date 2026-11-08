@@ -17,7 +17,9 @@ from memoryaid.app import (
     MSG_LET_ME_LOOK,
     MSG_NETWORK_ERROR,
     MSG_NOT_SET_UP,
+    MSG_RECORD_ACTIVE,
     MSG_RECORD_SAVED,
+    MSG_RECORD_UPLOADING,
     MemoryAidApp,
     map_error_to_spoken_message,
 )
@@ -136,13 +138,26 @@ class TestMemoriesAndCache(unittest.TestCase):
             second_b64 = places_second[0].images_b64[0]
             self.assertNotEqual(first_b64, second_b64)
 
-    def test_save_recorded_memory_writes_photo_and_note_files(self) -> None:
+    @patch("memoryaid.memories.requests.post")
+    def test_save_recorded_memory_writes_photo_and_note_files(self, mock_post: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 201
+        mock_resp.json.return_value = {
+            "id": "pi-upload-id-1234",
+            "filename": "sarahs_kitchen_where_bake-pi-uploa.jpg",
+            "description": "This is Sarah's kitchen where we bake cookies every Sunday.",
+            "uploadedAt": "2026-11-08T12:00:00.000Z",
+        }
+        mock_post.return_value = mock_resp
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             b64_img = _create_dummy_jpeg_b64()
             spoken = "This is Sarah's kitchen where we bake cookies every Sunday."
 
-            place = save_recorded_memory(root, b64_img, spoken)
+            place = save_recorded_memory(
+                root, b64_img, spoken, website_url="http://localhost:5173"
+            )
             self.assertEqual(place.name, "sarahs_kitchen_where_bake")
             self.assertTrue((root / place.name / "note.txt").is_file())
             self.assertTrue((root / place.name / "1.jpg").is_file())
@@ -150,6 +165,23 @@ class TestMemoriesAndCache(unittest.TestCase):
             self.assertEqual(
                 (root / place.name / "note.txt").read_text(encoding="utf-8").strip(),
                 spoken,
+            )
+            # Verify the photo and description were uploaded to the Caregiver Website
+            mock_post.assert_called_once()
+            upload_url = mock_post.call_args[0][0]
+            self.assertEqual(upload_url, "http://localhost:5173/api/photos")
+            self.assertEqual(
+                mock_post.call_args[1]["params"],
+                {
+                    "name": "sarahs_kitchen_where_bake.jpg",
+                    "description": spoken,
+                },
+            )
+            self.assertEqual(
+                mock_post.call_args[1]["headers"]["Content-Type"], "image/jpeg"
+            )
+            self.assertEqual(
+                mock_post.call_args[1]["data"], base64.b64decode(b64_img)
             )
 
     @patch("memoryaid.memories.requests.get")
@@ -219,7 +251,7 @@ class TestVisionPayloadAndCleaning(unittest.TestCase):
             get_gemini_endpoint("claude-haiku-5-5"),
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent",
         )
-        self.assertEqual(payload["generationConfig"]["maxOutputTokens"], 200)
+        self.assertEqual(payload["generationConfig"]["maxOutputTokens"], 2048)
         self.assertEqual(payload["system_instruction"]["parts"][0]["text"], SYSTEM_PROMPT)
         self.assertEqual(len(payload["contents"]), 1)
         self.assertEqual(payload["contents"][0]["role"], "user")
@@ -374,9 +406,21 @@ class TestErrorMappingAndAppLoop(unittest.TestCase):
         mock_speaker.wait.assert_called_once()
         mock_speaker.speak.assert_called_once_with("You're in a sunny kitchen.")
 
+    @patch("memoryaid.memories.requests.post")
     @patch("memoryaid.app.transcribe_audio_with_gemini")
-    def test_successful_hold_to_record_button_flow(self, mock_transcribe: MagicMock) -> None:
+    def test_successful_hold_to_record_button_flow(
+        self, mock_transcribe: MagicMock, mock_upload_post: MagicMock
+    ) -> None:
         mock_transcribe.return_value = "This is the living room where we watch movies."
+        mock_upload_resp = MagicMock()
+        mock_upload_resp.status_code = 201
+        mock_upload_resp.json.return_value = {
+            "id": "pi-living-room-123",
+            "filename": "living_room_where_watch-pi-livin.jpg",
+            "description": "This is the living room where we watch movies.",
+            "uploadedAt": "2026-11-08T12:00:00.000Z",
+        }
+        mock_upload_post.return_value = mock_upload_resp
         with tempfile.TemporaryDirectory() as tmp:
             cfg = Config(gemini_api_key="AIzaSyTestKey", memories_dir=Path(tmp))
             mock_cam = MagicMock()
@@ -393,16 +437,21 @@ class TestErrorMappingAndAppLoop(unittest.TestCase):
                 recorder=mock_recorder,
             )
 
-            # Press and hold Button 1
+            # 1st press of Button 1: speaks active prompt, captures photo, starts recording
             app.handle_record_press()
+            mock_speaker.speak.assert_called_once_with(MSG_RECORD_ACTIVE)
             mock_recorder.start_recording.assert_called_once()
             mock_cam.capture_base64.assert_called_once()
 
-            # Release Button 1
-            app.handle_record_release()
+            # 2nd press of Button 1: stops recording, transcribes, saves locally, speaks saved & uploading prompts, uploads
+            app.handle_record_press()
             mock_recorder.stop_recording.assert_called_once()
             mock_transcribe.assert_called_once()
-            mock_speaker.speak.assert_called_once_with(MSG_RECORD_SAVED)
+            self.assertEqual(
+                [c.args[0] for c in mock_speaker.speak.call_args_list],
+                [MSG_RECORD_ACTIVE, MSG_RECORD_SAVED, MSG_RECORD_UPLOADING],
+            )
+            mock_upload_post.assert_called_once()
 
             # Verify the new memory was written to disk and loaded into app.places
             self.assertEqual(len(app.places), 1)
