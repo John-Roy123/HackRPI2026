@@ -475,7 +475,23 @@ def query_vision_api(
                     last_error = VisionAPIError(f"HTTP 404 model not found ({current_model}): {err_detail}")
                     break  # Try next candidate model immediately
 
-                if status == 429 or status >= 500:
+                if status == 429:
+                    err_detail = (response.text or "")[:200].strip()
+                    last_error = VisionAPIError(f"HTTP 429 rate limit ({current_model}): {err_detail}")
+                    if _DISCOVERED_MODEL == current_model:
+                        _DISCOVERED_MODEL = ""
+                    logger.warning(
+                        "Gemini model %r hit HTTP 429 rate limit; switching to next Gemini model bucket...",
+                        current_model,
+                    )
+                    if not discovered_once:
+                        discovered_once = True
+                        for dm in reversed(_discover_available_gemini_MODELS(clean_key)):
+                            if dm not in candidate_models and dm not in _FAILED_404_MODELS:
+                                candidate_models.insert(idx, dm)
+                    break  # Try next model bucket immediately
+
+                if status >= 500:
                     last_error = VisionAPIError(f"HTTP {status} from Gemini API")
                     if attempt == 1:
                         logger.warning(

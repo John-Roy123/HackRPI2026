@@ -11,7 +11,7 @@ logger = logging.getLogger("memoryaid")
 class GpioButtons:
     """Manages the two GPIO buttons on the Raspberry Pi:
     1. Identify button (default GPIO17, Pin 11): single press tells the user what room/place they are in.
-    2. Record button (default GPIO27, Pin 13): press-and-hold takes a picture and listens; release saves what they said to a file.
+    2. Record button (default GPIO27, Pin 13): press once to start recording + take photo; press a second time to stop and save.
     """
 
     def __init__(
@@ -48,11 +48,9 @@ class GpioButtons:
         )
         if self._on_record_press is not None:
             self._record_button.when_pressed = self._on_record_press
-        if self._on_record_release is not None:
-            self._record_button.when_released = self._on_record_release
 
         logger.info(
-            "GPIO buttons initialised: Identify=GPIO%d, Record(hold)=GPIO%d (pull_up=True, bounce=%.2fs).",
+            "GPIO buttons initialised: Identify=GPIO%d, Record(toggle)=GPIO%d (pull_up=True, bounce=%.2fs).",
             self._identify_pin,
             self._record_pin,
             self._bounce_time,

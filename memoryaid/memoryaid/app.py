@@ -15,6 +15,7 @@ from .memories import (
     load_memories,
     save_recorded_memory,
     sync_remote_website_memories,
+    upload_memory_to_website,
 )
 from .speech import AudioRecordError, AudioRecorder, Speaker
 from .vision import (
@@ -31,8 +32,10 @@ logger = logging.getLogger("memoryaid")
 MSG_STARTUP_READY = "Hello. Press the button any time and I'll tell you where you are."
 MSG_NOT_SET_UP = "I'm not set up yet. Please ask your helper to finish setting me up."
 MSG_LET_ME_LOOK = "Let me take a look."
+MSG_RECORD_ACTIVE = "Recording is active. Please describe this place."
 MSG_RECORD_SAVED = "I've saved that memory for you."
-MSG_RECORD_ERROR = "I couldn't hear that clearly. Please hold the button and try again."
+MSG_RECORD_UPLOADING = "Uploading your memory to the website."
+MSG_RECORD_ERROR = "I couldn't hear that clearly. Please press the record button and try again."
 MSG_CAMERA_ERROR = "I can't see clearly just now. Please try again in a moment."
 MSG_NETWORK_ERROR = "I'm having trouble seeing right now. Please try again in a moment."
 
@@ -119,7 +122,11 @@ class MemoryAidApp:
     # Button 2: "Where am I?" (single press -> take photo -> tell user)
     # ------------------------------------------------------------------
     def handle_button_press(self) -> None:
-        """Handle a press of the 'Where am I?' button. Ignores presses while busy."""
+        """Handle a press of the 'Where am I?' button. If a recording is active, saves it first."""
+        if self._recording_active:
+            logger.info("Finishing and saving active recording before processing 'Where am I?' button press...")
+            self.handle_record_release()
+
         if not self._busy_lock.acquire(blocking=False):
             logger.info("Ignoring 'Where am I?' button press (already busy).")
             return
@@ -249,16 +256,20 @@ class MemoryAidApp:
         )
 
     # ------------------------------------------------------------------
-    # Button 1: "Record Memory" (press and hold -> take photo & listen;
-    #           release -> transcribe speech & write photo + text to file)
+    # Button 1: "Record Memory" (1st press -> take photo & start recording;
+    #           2nd press -> stop recording, transcribe speech & save file)
     # ------------------------------------------------------------------
     def handle_record_press(self) -> None:
-        """Called when the user presses and holds the Record Memory button."""
+        """Toggle recording on press: 1st press starts recording, 2nd press stops and saves."""
+        if self._recording_active:
+            self.handle_record_release()
+            return
+
         if not self._busy_lock.acquire(blocking=False):
             logger.info("Ignoring Record button press (device is already busy).")
             return
 
-        logger.info("Record button pressed and held: taking photo and starting electret microphone capture...")
+        logger.info("Record button pressed (1st press): starting microphone capture and taking photo...")
         if not self.config.has_api_key:
             logger.error("Cannot record memory: GEMINI_API_KEY is missing.")
             self._busy_lock.release()
@@ -266,13 +277,16 @@ class MemoryAidApp:
             return
 
         try:
-            # Start recording audio immediately while the user holds the button
-            self.recorder.start_recording()
             self._recording_active = True
-            # Take a picture of the room while listening
             self._recorded_photo_b64 = self.camera.capture_base64()
             self._persist_capture_locally(self._recorded_photo_b64)
-            logger.info("Captured room photo during record hold; listening until button release...")
+            print(
+                "\n[SYSTEM] Recording is active — please describe this place. Press the Record button again when finished.",
+                flush=True,
+            )
+            self.speaker.speak(MSG_RECORD_ACTIVE)
+            self.recorder.start_recording()
+            logger.info("Captured room photo and recording audio; press Record button again to stop and save.")
         except Exception as exc:
             logger.error("Failed to start memory recording: %s", exc)
             self._recording_active = False
@@ -281,12 +295,16 @@ class MemoryAidApp:
                 self.recorder.stop_recording()
             except Exception:
                 pass
-            self._busy_lock.release()
+            if self._busy_lock.locked():
+                try:
+                    self._busy_lock.release()
+                except RuntimeError:
+                    pass
             spoken_err = MSG_CAMERA_ERROR if isinstance(exc, CameraError) else MSG_RECORD_ERROR
             self.speaker.speak(spoken_err)
 
     def handle_record_release(self) -> None:
-        """Called when the user releases the Record Memory button."""
+        """Stop an active recording (called on 2nd press of Record button), transcribe speech, save locally, and upload."""
         if not self._recording_active:
             return
 
@@ -295,10 +313,10 @@ class MemoryAidApp:
         self._recorded_photo_b64 = None
 
         try:
-            logger.info("Record button released: stopping electret microphone and transcribing speech...")
+            logger.info("Record button pressed (2nd press): stopping microphone and transcribing speech...")
             wav_bytes = self.recorder.stop_recording()
             if not photo_b64:
-                raise CameraError("No photo was captured during button hold.")
+                raise CameraError("No photo was captured when recording started.")
 
             transcript = transcribe_audio_with_gemini(
                 wav_bytes=wav_bytes,
@@ -308,17 +326,31 @@ class MemoryAidApp:
             )
             logger.info("Transcribed spoken memory: %r", transcript)
 
-            self._save_memory_and_reload(photo_b64=photo_b64, note_text=transcript)
+            saved_place = self._save_memory_and_reload(photo_b64=photo_b64, note_text=transcript)
+            print(
+                f"\n[SYSTEM] Recording saved locally ({saved_place.name}): {transcript!r}",
+                flush=True,
+            )
             self.speaker.speak(MSG_RECORD_SAVED)
+
+            print(
+                f"\n[SYSTEM] Uploading photo and description for '{saved_place.name}' to the website...",
+                flush=True,
+            )
+            self.speaker.speak(MSG_RECORD_UPLOADING)
+            self._upload_saved_memory(saved_place=saved_place, photo_b64=photo_b64)
         except Exception as exc:
             logger.error("Failed to finish recording memory: %s", exc)
             self.speaker.speak(map_error_to_spoken_message(exc))
         finally:
             if self._busy_lock.locked():
-                self._busy_lock.release()
+                try:
+                    self._busy_lock.release()
+                except RuntimeError:
+                    pass
 
     def handle_mock_record(self, spoken_text: str) -> None:
-        """Simulate a press-and-hold memory recording in laptop mock mode."""
+        """Simulate a memory recording in laptop mock mode."""
         if not self._busy_lock.acquire(blocking=False):
             logger.info("Ignoring mock record (busy).")
             return
@@ -327,9 +359,21 @@ class MemoryAidApp:
                 logger.warning("Empty spoken text in mock record.")
                 self.speaker.speak(MSG_RECORD_ERROR)
                 return
+            print("\n[SYSTEM] Recording is active (mock mode)...", flush=True)
+            self.speaker.speak(MSG_RECORD_ACTIVE)
             photo_b64 = self.camera.capture_base64()
-            self._save_memory_and_reload(photo_b64=photo_b64, note_text=spoken_text)
+            saved_place = self._save_memory_and_reload(photo_b64=photo_b64, note_text=spoken_text)
+            print(
+                f"\n[SYSTEM] Recording saved locally ({saved_place.name}): {spoken_text!r}",
+                flush=True,
+            )
             self.speaker.speak(MSG_RECORD_SAVED)
+            print(
+                f"\n[SYSTEM] Uploading photo and description for '{saved_place.name}' to the website...",
+                flush=True,
+            )
+            self.speaker.speak(MSG_RECORD_UPLOADING)
+            self._upload_saved_memory(saved_place=saved_place, photo_b64=photo_b64)
         except Exception as exc:
             logger.error("Mock record failed: %s", exc)
             self.speaker.speak(map_error_to_spoken_message(exc))
@@ -372,6 +416,8 @@ class MemoryAidApp:
             memories_dir=self.config.memories_dir,
             captured_b64=photo_b64,
             note_text=note_text,
+            website_url=self.config.website_url,
+            upload_to_website=False,
         )
         # Reload places and rebuild the composite contact sheet so the new place is immediately active
         self.places = load_memories(self.config.memories_dir)
@@ -381,6 +427,20 @@ class MemoryAidApp:
             captures_dir=self.config.captures_dir,
         )
         return saved_place
+
+    def _upload_saved_memory(self, saved_place: PlaceMemory, photo_b64: str) -> None:
+        """Upload a newly saved local memory to the Caregiver Website."""
+        try:
+            raw_jpeg = base64.b64decode(photo_b64)
+            upload_memory_to_website(
+                memories_dir=self.config.memories_dir,
+                folder_name=saved_place.name,
+                jpeg_bytes=raw_jpeg,
+                description=saved_place.note,
+                website_url=self.config.website_url,
+            )
+        except Exception as exc:
+            logger.warning("Website upload after recording skipped: %s", exc)
 
     def run_dry_run(self) -> int:
         """Sync website memories, capture one image, build the full request payload, print the summary, and return payload size."""
