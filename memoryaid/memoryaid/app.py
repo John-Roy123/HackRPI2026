@@ -350,18 +350,30 @@ class MemoryAidApp:
                     pass
 
     def handle_mock_record(self, spoken_text: str) -> None:
-        """Simulate a memory recording in laptop mock mode."""
-        if not self._busy_lock.acquire(blocking=False):
+        """Record a memory with an explicit text description (or finish an active CLI recording with text)."""
+        was_recording = self._recording_active
+        if was_recording:
+            self._recording_active = False
+            try:
+                self.recorder.stop_recording()
+            except Exception:
+                pass
+        elif not self._busy_lock.acquire(blocking=False):
             logger.info("Ignoring mock record (busy).")
             return
+
         try:
             if not spoken_text.strip():
                 logger.warning("Empty spoken text in mock record.")
                 self.speaker.speak(MSG_RECORD_ERROR)
                 return
-            print("\n[SYSTEM] Recording is active (mock mode)...", flush=True)
-            self.speaker.speak(MSG_RECORD_ACTIVE)
-            photo_b64 = self.camera.capture_base64()
+            photo_b64 = self._recorded_photo_b64
+            self._recorded_photo_b64 = None
+            if not photo_b64:
+                print("\n[SYSTEM] Recording is active — capturing photo...", flush=True)
+                self.speaker.speak(MSG_RECORD_ACTIVE)
+                photo_b64 = self.camera.capture_base64()
+                self._persist_capture_locally(photo_b64)
             saved_place = self._save_memory_and_reload(photo_b64=photo_b64, note_text=spoken_text)
             print(
                 f"\n[SYSTEM] Recording saved locally ({saved_place.name}): {spoken_text!r}",
@@ -378,7 +390,104 @@ class MemoryAidApp:
             logger.error("Mock record failed: %s", exc)
             self.speaker.speak(map_error_to_spoken_message(exc))
         finally:
-            self._busy_lock.release()
+            if self._busy_lock.locked():
+                try:
+                    self._busy_lock.release()
+                except RuntimeError:
+                    pass
+
+    def run_cli_record(self, description_arg: str = "") -> int:
+        """Command-line Record & Upload toggle for proof-of-concept (`python3 -m memoryaid --record`).
+
+        - If `description_arg` is provided on the CLI (`--record "This is the kitchen"`):
+          captures a photo, speaks the active/saved/uploading prompts, saves locally, and uploads to the website.
+        - Otherwise (interactive toggle mode, `--record` with no text):
+          1st step starts recording + captures photo + speaks active prompt, then waits for Enter
+          (or a typed description + Enter) to stop recording, save locally, and upload to the website.
+        """
+        import sys
+
+        try:
+            self.speaker.connect_bluetooth()
+        except Exception as exc:
+            logger.warning("Bluetooth speaker connection check failed: %s", exc)
+
+        self.camera.start()
+
+        # Mode A: Description text passed directly via `--record "This is the kitchen"`
+        if description_arg and description_arg.strip():
+            self.handle_mock_record(description_arg.strip())
+            return 0
+
+        # Mode B: Interactive two-step toggle via Enter in the terminal
+        print("\n[SYSTEM] Starting Record & Upload mode (1st toggle: Record ACTIVE)...", flush=True)
+        photo_b64 = self.camera.capture_base64()
+        self._persist_capture_locally(photo_b64)
+        print(
+            "\n[SYSTEM] Recording is active — please describe this place.",
+            flush=True,
+        )
+        self.speaker.speak(MSG_RECORD_ACTIVE)
+
+        mic_started = False
+        try:
+            self.recorder.start_recording()
+            mic_started = True
+        except Exception as exc:
+            logger.warning("Microphone capture unavailable (%s); you can type the description below.", exc)
+
+        sys.stdout.write(
+            "\n>>> Recording is ACTIVE! Speak into the microphone and press ENTER to stop, save & upload\n"
+            "    (or type a description and press ENTER): "
+        )
+        sys.stdout.flush()
+        try:
+            user_line = sys.stdin.readline().strip()
+        except KeyboardInterrupt:
+            user_line = ""
+
+        wav_bytes = b""
+        if mic_started:
+            try:
+                wav_bytes = self.recorder.stop_recording()
+            except Exception as exc:
+                logger.warning("Microphone stop warning: %s", exc)
+
+        transcript = user_line
+        if not transcript and wav_bytes:
+            try:
+                transcript = transcribe_audio_with_gemini(
+                    wav_bytes=wav_bytes,
+                    api_key=self.config.gemini_api_key,
+                    model=self.config.model,
+                    captured_b64=photo_b64,
+                )
+            except Exception as exc:
+                logger.warning("Audio transcription failed (%s).", exc)
+
+        if not transcript:
+            sys.stdout.write("\n>>> Enter a description for the captured photo: ")
+            sys.stdout.flush()
+            transcript = sys.stdin.readline().strip() or "Recorded place memory"
+
+        saved_place = self._save_memory_and_reload(photo_b64=photo_b64, note_text=transcript)
+        print(
+            f"\n[SYSTEM] Recording saved locally ({saved_place.name}): {transcript!r}",
+            flush=True,
+        )
+        self.speaker.speak(MSG_RECORD_SAVED)
+
+        print(
+            f"\n[SYSTEM] Uploading photo and description for '{saved_place.name}' to the website...",
+            flush=True,
+        )
+        self.speaker.speak(MSG_RECORD_UPLOADING)
+        self._upload_saved_memory(saved_place=saved_place, photo_b64=photo_b64)
+        print(
+            f"\n[SYSTEM] Done! '{saved_place.name}' saved and uploaded to the Caregiver Website.",
+            flush=True,
+        )
+        return 0
 
     def _persist_capture_locally(self, captured_b64: str) -> None:
         """Unconditionally save every captured camera frame to disk inside HackRPI2026/memoryaid/."""
