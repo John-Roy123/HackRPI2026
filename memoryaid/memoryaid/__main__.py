@@ -57,6 +57,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="Override WEBSITE_URL for the external HackRPI2026 Caregiver Website (e.g. http://192.168.1.50:5173).",
     )
+    parser.add_argument(
+        "-r",
+        "--record",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="DESCRIPTION",
+        help="Toggle the Record & Upload function from the command line (press Enter to stop/save/upload, or pass DESCRIPTION directly).",
+    )
     return parser.parse_args(argv)
 
 
@@ -146,6 +155,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         finally:
             app.close()
 
+    if args.record is not None:
+        app = MemoryAidApp(
+            config=config,
+            places=places,
+            camera=camera,
+            speaker=speaker,
+            recorder=recorder,
+            button=None,
+        )
+        try:
+            return app.run_cli_record(description_arg=args.record)
+        finally:
+            app.close()
+
     app = MemoryAidApp(
         config=config,
         places=places,
@@ -168,6 +191,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             on_identify_press=app.handle_button_press,
             on_record_press=app.handle_record_press,
             on_record_release=app.handle_record_release,
+            on_text_record=app.handle_mock_record,
         )
     app.button = button
 

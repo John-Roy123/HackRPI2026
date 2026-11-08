@@ -546,6 +546,49 @@ class TestErrorMappingAndAppLoop(unittest.TestCase):
         self.assertAlmostEqual(sum(out_samples) / len(out_samples), 0.0, delta=5.0)
         self.assertGreater(max(abs(s) for s in out_samples), 4000)
 
+    @patch("memoryaid.memories.requests.post")
+    def test_cli_record_and_upload_option(self, mock_upload_post: MagicMock) -> None:
+        from memoryaid.__main__ import parse_args
+
+        parsed_toggle = parse_args(["--record"])
+        self.assertEqual(parsed_toggle.record, "")
+        parsed_with_desc = parse_args(["--record", "This is the dining room."])
+        self.assertEqual(parsed_with_desc.record, "This is the dining room.")
+
+        mock_upload_resp = MagicMock()
+        mock_upload_resp.status_code = 201
+        mock_upload_resp.json.return_value = {
+            "id": "cli-dining-123",
+            "filename": "dining_room-cli-dinin.jpg",
+            "description": "This is the dining room.",
+            "uploadedAt": "2026-11-08T12:00:00.000Z",
+        }
+        mock_upload_post.return_value = mock_upload_resp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(gemini_api_key="AIzaSyTestKey", memories_dir=Path(tmp))
+            mock_cam = MagicMock()
+            mock_cam.capture_base64.return_value = _create_dummy_jpeg_b64()
+            mock_speaker = MagicMock()
+            mock_recorder = MagicMock()
+
+            app = MemoryAidApp(
+                config=cfg,
+                places=[],
+                camera=mock_cam,
+                speaker=mock_speaker,
+                recorder=mock_recorder,
+            )
+            rc = app.run_cli_record(description_arg="This is the dining room.")
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                [c.args[0] for c in mock_speaker.speak.call_args_list],
+                [MSG_RECORD_ACTIVE, MSG_RECORD_SAVED, MSG_RECORD_UPLOADING],
+            )
+            mock_upload_post.assert_called_once()
+            self.assertEqual(len(app.places), 1)
+            self.assertEqual(app.places[0].note, "This is the dining room.")
+
 
 if __name__ == "__main__":
     unittest.main()
